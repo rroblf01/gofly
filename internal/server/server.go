@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -38,6 +39,7 @@ type Server struct {
 	logCh      chan logEntry
 	logWg      sync.WaitGroup
 	stopLog    chan struct{}
+	listeners  []net.Listener
 }
 
 type tokenBucket struct {
@@ -252,10 +254,46 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 }
 
 func (s *Server) ListenAndServe() error {
-	if s.cfg.TLS != nil && s.cfg.TLS.Enabled {
-		return s.http.ListenAndServeTLS(s.cfg.TLS.CertFile, s.cfg.TLS.KeyFile)
+	workers := s.cfg.Workers
+	if workers < 1 {
+		workers = 1
 	}
-	return s.http.ListenAndServe()
+
+	addr := fmt.Sprintf(":%d", s.cfg.Port)
+
+	for i := 0; i < workers; i++ {
+		l, err := listen("tcp", addr)
+		if err != nil {
+			return err
+		}
+		s.listeners = append(s.listeners, l)
+	}
+
+	errCh := make(chan error, len(s.listeners))
+
+	for _, l := range s.listeners {
+		l := l
+		go func() {
+			if s.cfg.TLS != nil && s.cfg.TLS.Enabled {
+				errCh <- s.http.ServeTLS(l, s.cfg.TLS.CertFile, s.cfg.TLS.KeyFile)
+			} else {
+				errCh <- s.http.Serve(l)
+			}
+		}()
+	}
+
+	err := <-errCh
+	for _, l := range s.listeners {
+		l.Close()
+	}
+	for range len(s.listeners) - 1 {
+		<-errCh
+	}
+
+	if err != nil && !errors.Is(err, http.ErrServerClosed) {
+		return err
+	}
+	return nil
 }
 
 func (s *Server) Shutdown(ctx context.Context) error {
@@ -271,8 +309,9 @@ func Run(cfg config.Config) error {
 	errCh := make(chan error, 1)
 	go func() {
 		logger.Info("starting server", logger.LogFields{
-			"port": cfg.Port,
-			"tls":  cfg.TLS != nil && cfg.TLS.Enabled,
+			"port":   cfg.Port,
+			"tls":    cfg.TLS != nil && cfg.TLS.Enabled,
+			"workers": cfg.Workers,
 		})
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err

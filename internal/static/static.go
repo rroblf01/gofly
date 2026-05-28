@@ -8,9 +8,17 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/rroblf01/gofly/internal/config"
 )
+
+var sniffPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 512)
+		return &b
+	},
+}
 
 type Handler struct {
 	root     string
@@ -83,18 +91,48 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		stat = istat
 		f.Close()
 		f = idx
+		target = filepath.Join(target, "index.html")
 	}
 
-	serveFile(w, f, stat, h.cacheTTL)
+	if gz, ok := precompressedGzip(r, target); ok {
+		defer gz.f.Close()
+		serveFile(w, gz.f, gz.stat, h.cacheTTL, gz.orig)
+		return
+	}
+
+	serveFile(w, f, stat, h.cacheTTL, target)
 }
 
-func serveFile(w http.ResponseWriter, f *os.File, stat os.FileInfo, cacheTTL string) {
-	ctype := mime.TypeByExtension(filepath.Ext(stat.Name()))
+type gzipFile struct {
+	f    *os.File
+	stat os.FileInfo
+	orig string
+}
+
+func precompressedGzip(r *http.Request, target string) (*gzipFile, bool) {
+	if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+		return nil, false
+	}
+	gzf, err := os.Open(target + ".gz")
+	if err != nil {
+		return nil, false
+	}
+	gzstat, err := gzf.Stat()
+	if err != nil || gzstat.IsDir() {
+		gzf.Close()
+		return nil, false
+	}
+	return &gzipFile{f: gzf, stat: gzstat, orig: target}, true
+}
+
+func serveFile(w http.ResponseWriter, f *os.File, stat os.FileInfo, cacheTTL string, origName string) {
+	ctype := mime.TypeByExtension(filepath.Ext(origName))
 	if ctype == "" {
-		buf := make([]byte, 512)
-		n, _ := f.Read(buf)
-		ctype = http.DetectContentType(buf[:n])
+		bufp := sniffPool.Get().(*[]byte)
+		n, _ := f.Read(*bufp)
+		ctype = http.DetectContentType((*bufp)[:n])
 		f.Seek(0, io.SeekStart)
+		sniffPool.Put(bufp)
 	}
 	w.Header().Set("Content-Type", ctype)
 	w.Header().Set("Content-Length", strconv.FormatInt(stat.Size(), 10))
