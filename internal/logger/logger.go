@@ -7,16 +7,16 @@ import (
 	"time"
 )
 
-var Log *slog.Logger
+var log *slog.Logger
 
 func Init() {
-	Log = slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+	log = slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
 	}))
 }
 
 func InitDebug() {
-	Log = slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+	log = slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 		Level: slog.LevelDebug,
 	}))
 }
@@ -39,26 +39,26 @@ func RequestID(ctx context.Context) string {
 type LogFields map[string]any
 
 func Info(msg string, fields LogFields) {
-	if Log != nil {
-		Log.Info(msg, slogFields(fields)...)
+	if log != nil {
+		log.Info(msg, slogFields(fields)...)
 	}
 }
 
 func Debug(msg string, fields LogFields) {
-	if Log != nil {
-		Log.Debug(msg, slogFields(fields)...)
+	if log != nil {
+		log.Debug(msg, slogFields(fields)...)
 	}
 }
 
 func Warn(msg string, fields LogFields) {
-	if Log != nil {
-		Log.Warn(msg, slogFields(fields)...)
+	if log != nil {
+		log.Warn(msg, slogFields(fields)...)
 	}
 }
 
 func Error(msg string, fields LogFields) {
-	if Log != nil {
-		Log.Error(msg, slogFields(fields)...)
+	if log != nil {
+		log.Error(msg, slogFields(fields)...)
 	}
 }
 
@@ -71,8 +71,8 @@ func slogFields(fields LogFields) []any {
 }
 
 func LogAccess(start time.Time, method, path string, status int, dur time.Duration, upstream string) {
-	if Log != nil {
-		Log.Info("access",
+	if log != nil {
+		log.Info("access",
 			slog.String("method", method),
 			slog.String("path", path),
 			slog.Int("status", status),

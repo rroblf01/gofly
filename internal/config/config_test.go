@@ -135,10 +135,24 @@ func TestLoad_TLSWithoutCert(t *testing.T) {
 	}
 }
 
-func TestLoad_TLSWithAutoCert(t *testing.T) {
+func TestLoad_MutualExclusionStaticAndProxy(t *testing.T) {
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "config.json")
-	data := `{"tls":{"enabled":true,"auto_cert":true},"routes":[{"path":"/","upstreams":["http://localhost:8080"]}]}`
+	data := `{"routes":[{"path":"/","static_dir":"/www","upstreams":["http://localhost:8080"]}]}`
+	if err := os.WriteFile(cfgPath, []byte(data), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := Load(cfgPath)
+	if err == nil {
+		t.Fatal("expected error for route with both static_dir and upstreams, got nil")
+	}
+}
+
+func TestLoad_EmptyRoutes(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+	data := `{"routes":[]}`
 	if err := os.WriteFile(cfgPath, []byte(data), 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -146,6 +160,113 @@ func TestLoad_TLSWithAutoCert(t *testing.T) {
 	_, err := Load(cfgPath)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestLoad_InvalidDuration(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+	data := `{"read_timeout":"1x","routes":[{"path":"/","upstreams":["http://localhost:8080"]}]}`
+	if err := os.WriteFile(cfgPath, []byte(data), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := Load(cfgPath)
+	if err == nil {
+		t.Fatal("expected error for invalid duration, got nil")
+	}
+}
+
+func TestLoad_InvalidStrategy(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+	data := `{"routes":[{"path":"/","upstreams":["http://localhost:8080"],"strategy":"least_connections"}]}`
+	if err := os.WriteFile(cfgPath, []byte(data), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := Load(cfgPath)
+	if err == nil {
+		t.Fatal("expected error for unsupported strategy, got nil")
+	}
+}
+
+func TestLoad_NegativeMaxFails(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+	data := `{"routes":[{"path":"/","upstreams":["http://localhost:8080"],"max_fails":-1}]}`
+	if err := os.WriteFile(cfgPath, []byte(data), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := Load(cfgPath)
+	if err == nil {
+		t.Fatal("expected error for negative max_fails, got nil")
+	}
+}
+
+func TestLoad_RateLimitConfig(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+	data := `{"rate_limit":{"requests_per_second":10,"burst":20},"routes":[{"path":"/","upstreams":["http://localhost:8080"]}]}`
+	if err := os.WriteFile(cfgPath, []byte(data), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(cfgPath)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.RateLimit.RequestsPerSecond != 10 {
+		t.Errorf("rate = %f, want 10", cfg.RateLimit.RequestsPerSecond)
+	}
+	if cfg.RateLimit.Burst != 20 {
+		t.Errorf("burst = %d, want 20", cfg.RateLimit.Burst)
+	}
+}
+
+func TestLoad_InvalidRateLimit(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+	data := `{"rate_limit":{"requests_per_second":0,"burst":0},"routes":[{"path":"/","upstreams":["http://localhost:8080"]}]}`
+	if err := os.WriteFile(cfgPath, []byte(data), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := Load(cfgPath)
+	if err == nil {
+		t.Fatal("expected error for invalid rate limit, got nil")
+	}
+}
+
+func TestDurationRoundTrip(t *testing.T) {
+	d := Duration{30 * time.Second}
+	data, err := d.MarshalJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != `"30s"` {
+		t.Errorf("marshal = %s, want \"30s\"", string(data))
+	}
+
+	var d2 Duration
+	if err := d2.UnmarshalJSON(data); err != nil {
+		t.Fatal(err)
+	}
+	if d2.Duration != 30*time.Second {
+		t.Errorf("unmarshal = %v, want 30s", d2.Duration)
+	}
+}
+
+func TestEffectiveMaxBodySize(t *testing.T) {
+	r := Route{Path: "/", Upstreams: []string{"http://localhost:8080"}}
+	if s := r.EffectiveMaxBodySize(100); s != 100 {
+		t.Errorf("effective = %d, want 100", s)
+	}
+
+	r.MaxBodySize = 500
+	if s := r.EffectiveMaxBodySize(100); s != 500 {
+		t.Errorf("effective = %d, want 500", s)
 	}
 }
 

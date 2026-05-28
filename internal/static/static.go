@@ -1,17 +1,19 @@
 package static
 
 import (
+	"fmt"
 	"net/http"
+	"path/filepath"
 	"strings"
 
 	"github.com/rroblf01/gofly/internal/config"
-	"github.com/rroblf01/gofly/internal/logger"
 )
 
 type Handler struct {
 	dir      string
 	cacheTTL int
 	fs       http.Handler
+	prefix   string
 }
 
 func New(route config.Route) *Handler {
@@ -20,43 +22,42 @@ func New(route config.Route) *Handler {
 		cacheTTL = int(route.BrowserCacheTTL.Seconds())
 	}
 
-	fs := http.FileServer(http.Dir(route.StaticDir))
+	absDir, _ := filepath.Abs(route.StaticDir)
+	fs := http.StripPrefix(route.Path, http.FileServer(http.Dir(route.StaticDir)))
 
 	return &Handler{
-		dir:      route.StaticDir,
+		dir:      absDir,
 		cacheTTL: cacheTTL,
 		fs:       fs,
+		prefix:   route.Path,
 	}
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if strings.Contains(r.URL.Path, "..") {
+	if !h.safePath(r.URL.Path) {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
 
 	if h.cacheTTL > 0 {
-		w.Header().Set("Cache-Control", "public, max-age="+itoa(h.cacheTTL))
+		w.Header().Set("Cache-Control", fmt.Sprintf("public, max-age=%d", h.cacheTTL))
 	}
 
 	h.fs.ServeHTTP(w, r)
-
-	logger.Info("static served", logger.LogFields{
-		"path":   r.URL.Path,
-		"method": r.Method,
-	})
 }
 
-func itoa(i int) string {
-	if i == 0 {
-		return "0"
+func (h *Handler) safePath(path string) bool {
+	if strings.Contains(path, "..") {
+		return false
 	}
-	var buf [12]byte
-	pos := len(buf)
-	for i > 0 {
-		pos--
-		buf[pos] = byte('0' + i%10)
-		i /= 10
+
+	clean := filepath.Clean(strings.TrimPrefix(path, "/"))
+	target := filepath.Join(h.dir, clean)
+
+	root := filepath.Clean(h.dir)
+	if !strings.HasPrefix(target, root+string(filepath.Separator)) && target != root {
+		return false
 	}
-	return string(buf[pos:])
+
+	return true
 }

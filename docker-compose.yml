@@ -1,0 +1,19 @@
+version: "3.9"
+
+services:
+  gofly:
+    build: .
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./config.json:/etc/gofly/config.json:ro
+      - ./www:/var/www/html:ro
+    restart: unless-stopped
+
+  whoami:
+    image: traefik/whoami
+    ports:
+      - "3001:80"
+    profiles:
+      - example

@@ -13,27 +13,40 @@ type Config struct {
 	ReadTimeout  Duration   `json:"read_timeout,omitempty"`
 	WriteTimeout Duration   `json:"write_timeout,omitempty"`
 	IdleTimeout  Duration   `json:"idle_timeout,omitempty"`
+	MaxBodySize  int64      `json:"max_body_size,omitempty"`
+	RateLimit    *RateLimit `json:"rate_limit,omitempty"`
 	TLS          *TLSConfig `json:"tls,omitempty"`
 	Routes       []Route    `json:"routes"`
+}
+
+type RateLimit struct {
+	RequestsPerSecond float64 `json:"requests_per_second"`
+	Burst             int     `json:"burst"`
 }
 
 type TLSConfig struct {
 	Enabled  bool   `json:"enabled"`
 	CertFile string `json:"cert_file"`
 	KeyFile  string `json:"key_file"`
-	AutoCert bool   `json:"auto_cert,omitempty"`
-	CacheDir string `json:"cache_dir,omitempty"`
 }
 
 type Route struct {
 	Path            string            `json:"path"`
 	Host            string            `json:"host,omitempty"`
+	ServerName      string            `json:"server_name,omitempty"`
 	Upstreams       []string          `json:"upstreams,omitempty"`
 	Strategy        string            `json:"strategy,omitempty"`
 	SetHeaders      map[string]string `json:"set_headers,omitempty"`
 	RemoveHeaders   []string          `json:"remove_headers,omitempty"`
 	StaticDir       string            `json:"static_dir,omitempty"`
 	BrowserCacheTTL *Duration         `json:"browser_cache_ttl,omitempty"`
+	Rewrite         string            `json:"rewrite,omitempty"`
+	UpstreamTimeout *Duration         `json:"upstream_timeout,omitempty"`
+	RetryOnError    bool              `json:"retry_on_error,omitempty"`
+	MaxBodySize     int64             `json:"max_body_size,omitempty"`
+	MaxFails        int               `json:"max_fails,omitempty"`
+	FailTimeout     *Duration         `json:"fail_timeout,omitempty"`
+	Gzip            *bool             `json:"gzip,omitempty"`
 }
 
 type Duration struct {
@@ -90,22 +103,44 @@ func (c *Config) validate() error {
 		return fmt.Errorf("port %d out of range [1-65535]", c.Port)
 	}
 	if c.TLS != nil && c.TLS.Enabled {
-		if !c.TLS.AutoCert {
-			if c.TLS.CertFile == "" {
-				return fmt.Errorf("tls.cert_file is required when tls is enabled")
-			}
-			if c.TLS.KeyFile == "" {
-				return fmt.Errorf("tls.key_file is required when tls is enabled")
-			}
+		if c.TLS.CertFile == "" {
+			return fmt.Errorf("tls.cert_file is required when tls is enabled")
+		}
+		if c.TLS.KeyFile == "" {
+			return fmt.Errorf("tls.key_file is required when tls is enabled")
+		}
+	}
+	if c.RateLimit != nil {
+		if c.RateLimit.RequestsPerSecond <= 0 {
+			return fmt.Errorf("rate_limit.requests_per_second must be positive")
+		}
+		if c.RateLimit.Burst < 1 {
+			return fmt.Errorf("rate_limit.burst must be at least 1")
 		}
 	}
 	for i, r := range c.Routes {
 		if r.Path == "" {
 			return fmt.Errorf("routes[%d].path is required", i)
 		}
+		if r.StaticDir != "" && len(r.Upstreams) > 0 {
+			return fmt.Errorf("routes[%d]: static_dir and upstreams are mutually exclusive", i)
+		}
 		if r.StaticDir == "" && len(r.Upstreams) == 0 {
 			return fmt.Errorf("routes[%d]: static_dir or upstreams required", i)
 		}
+		if r.Strategy != "" && r.Strategy != "round_robin" {
+			return fmt.Errorf("routes[%d]: unsupported strategy %q", i, r.Strategy)
+		}
+		if r.MaxFails < 0 {
+			return fmt.Errorf("routes[%d].max_fails must be non-negative", i)
+		}
 	}
 	return nil
+}
+
+func (r *Route) EffectiveMaxBodySize(defaultSize int64) int64 {
+	if r.MaxBodySize > 0 {
+		return r.MaxBodySize
+	}
+	return defaultSize
 }

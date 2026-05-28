@@ -1,6 +1,7 @@
 package server
 
 import (
+	"compress/gzip"
 	"context"
 	"io"
 	"net"
@@ -14,13 +15,15 @@ import (
 	"github.com/rroblf01/gofly/internal/logger"
 )
 
+func init() {
+	logger.Init()
+}
+
 func writeFile(path, content string, mode os.FileMode) error {
 	return os.WriteFile(path, []byte(content), mode)
 }
 
 func TestServer_HealthEndpoint(t *testing.T) {
-	logger.Init()
-
 	cfg := config.Config{
 		Port:   0,
 		Routes: []config.Route{},
@@ -59,8 +62,6 @@ func TestServer_HealthEndpoint(t *testing.T) {
 }
 
 func TestServer_StaticRoute(t *testing.T) {
-	logger.Init()
-
 	dir := t.TempDir()
 	if err := writeFile(dir+"/index.html", "hello world", 0644); err != nil {
 		t.Fatal(err)
@@ -106,8 +107,6 @@ func TestServer_StaticRoute(t *testing.T) {
 }
 
 func TestServer_ProxyRoute(t *testing.T) {
-	logger.Init()
-
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("backend"))
 	}))
@@ -153,8 +152,6 @@ func TestServer_ProxyRoute(t *testing.T) {
 }
 
 func TestServer_GracefulShutdown(t *testing.T) {
-	logger.Init()
-
 	cfg := config.Config{
 		Port:   0,
 		Routes: []config.Route{},
@@ -201,11 +198,14 @@ func TestResponseWriter(t *testing.T) {
 	if rw.status != http.StatusNotFound {
 		t.Errorf("status should not change after first WriteHeader, got %d", rw.status)
 	}
+
+	rw.SetUpstream("10.0.0.1:8080")
+	if rw.upstream != "10.0.0.1:8080" {
+		t.Errorf("upstream = %q, want %q", rw.upstream, "10.0.0.1:8080")
+	}
 }
 
 func TestServer_RouteNotFound(t *testing.T) {
-	logger.Init()
-
 	cfg := config.Config{
 		Port:   0,
 		Routes: []config.Route{},
@@ -236,4 +236,152 @@ func TestServer_RouteNotFound(t *testing.T) {
 	if resp.StatusCode != http.StatusNotFound {
 		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusNotFound)
 	}
+}
+
+func TestExtractIP(t *testing.T) {
+	tests := []struct {
+		name       string
+		remoteAddr string
+		headers    map[string]string
+		want       string
+	}{
+		{"X-Forwarded-For single", "1.1.1.1:1234", map[string]string{"X-Forwarded-For": "2.2.2.2"}, "2.2.2.2"},
+		{"X-Forwarded-For multi", "1.1.1.1:1234", map[string]string{"X-Forwarded-For": "2.2.2.2, 3.3.3.3"}, "2.2.2.2"},
+		{"RemoteAddr IPv4", "4.4.4.4:5678", nil, "4.4.4.4"},
+		{"RemoteAddr IPv6", "[::1]:8080", nil, "[::1]"},
+		{"RemoteAddr no port", "5.5.5.5", nil, "5.5.5.5"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest("GET", "/", nil)
+			req.RemoteAddr = tt.remoteAddr
+			for k, v := range tt.headers {
+				req.Header.Set(k, v)
+			}
+			got := extractIP(req)
+			if got != tt.want {
+				t.Errorf("extractIP = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestTokenBucket(t *testing.T) {
+	t.Run("allow and deny", func(t *testing.T) {
+		tb := newTokenBucket(0, 1)
+		if !tb.allow() {
+			t.Error("expected allow on first call")
+		}
+		if tb.allow() {
+			t.Error("expected deny after tokens exhausted")
+		}
+	})
+
+	t.Run("burst capacity", func(t *testing.T) {
+		tb := newTokenBucket(0, 3)
+		for i := 0; i < 3; i++ {
+			if !tb.allow() {
+				t.Errorf("expected allow on call %d", i+1)
+			}
+		}
+		if tb.allow() {
+			t.Error("expected deny after burst exhausted")
+		}
+	})
+
+	t.Run("refill over time", func(t *testing.T) {
+		tb := newTokenBucket(100, 1)
+		tb.allow()
+
+		time.Sleep(50 * time.Millisecond)
+
+		if !tb.allow() {
+			t.Error("expected allow after refill")
+		}
+	})
+}
+
+func TestGzipMiddleware(t *testing.T) {
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("hello world"))
+	})
+	handler := gzipMiddleware(inner)
+
+	t.Run("with gzip", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/", nil)
+		req.Header.Set("Accept-Encoding", "gzip")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Header().Get("Content-Encoding") != "gzip" {
+			t.Error("expected Content-Encoding: gzip")
+		}
+		if rec.Header().Get("Vary") != "Accept-Encoding" {
+			t.Error("expected Vary: Accept-Encoding")
+		}
+
+		gr, err := gzip.NewReader(rec.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer gr.Close()
+		body, _ := io.ReadAll(gr)
+		if string(body) != "hello world" {
+			t.Errorf("body = %q, want %q", string(body), "hello world")
+		}
+	})
+
+	t.Run("without gzip", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/", nil)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Header().Get("Content-Encoding") == "gzip" {
+			t.Error("did not expect gzip Content-Encoding")
+		}
+		if rec.Body.String() != "hello world" {
+			t.Errorf("body = %q, want %q", rec.Body.String(), "hello world")
+		}
+	})
+}
+
+func TestHostBasedRouting(t *testing.T) {
+	dir := t.TempDir()
+	if err := writeFile(dir+"/index.html", "host content", 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := config.Config{
+		Port: 0,
+		Routes: []config.Route{
+			{Path: "/", ServerName: "example.com", StaticDir: dir},
+		},
+	}
+
+	srv := New(cfg)
+
+	t.Run("matching host", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/", nil)
+		req.Host = "example.com"
+		rec := httptest.NewRecorder()
+		srv.mux.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Errorf("status = %d, want %d", rec.Code, http.StatusOK)
+		}
+		if rec.Body.String() != "host content" {
+			t.Errorf("body = %q, want %q", rec.Body.String(), "host content")
+		}
+	})
+
+	t.Run("non-matching host", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/", nil)
+		req.Host = "other.com"
+		rec := httptest.NewRecorder()
+		srv.mux.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusNotFound {
+			t.Errorf("status = %d, want %d", rec.Code, http.StatusNotFound)
+		}
+	})
 }

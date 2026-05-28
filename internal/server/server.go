@@ -1,12 +1,15 @@
 package server
 
 import (
+	"compress/gzip"
 	"context"
 	"errors"
 	"fmt"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -17,24 +20,65 @@ import (
 )
 
 type Server struct {
-	cfg  config.Config
-	http *http.Server
-	mux  *http.ServeMux
+	cfg        config.Config
+	http       *http.Server
+	mux        *http.ServeMux
+	rateLimits map[string]*tokenBucket
+	rlMu       sync.RWMutex
+}
+
+type tokenBucket struct {
+	tokens     float64
+	maxTokens  float64
+	refillRate float64
+	lastRefill time.Time
+	mu         sync.Mutex
+}
+
+func newTokenBucket(rate float64, burst int) *tokenBucket {
+	return &tokenBucket{
+		tokens:     float64(burst),
+		maxTokens:  float64(burst),
+		refillRate: rate,
+		lastRefill: time.Now(),
+	}
+}
+
+func (tb *tokenBucket) allow() bool {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+
+	now := time.Now()
+	elapsed := now.Sub(tb.lastRefill).Seconds()
+	tb.tokens = min(tb.maxTokens, tb.tokens+elapsed*tb.refillRate)
+	tb.lastRefill = now
+
+	if tb.tokens >= 1 {
+		tb.tokens--
+		return true
+	}
+	return false
 }
 
 func New(cfg config.Config) *Server {
 	mux := http.NewServeMux()
 
 	s := &Server{
-		cfg: cfg,
-		mux: mux,
+		cfg:        cfg,
+		mux:        mux,
+		rateLimits: make(map[string]*tokenBucket),
 	}
 
 	s.registerRoutes()
 
+	handler := s.middleware(mux)
+	if cfg.RateLimit != nil {
+		handler = s.rateLimitMiddleware(handler)
+	}
+
 	s.http = &http.Server{
 		Addr:         fmt.Sprintf(":%d", cfg.Port),
-		Handler:      s.middleware(mux),
+		Handler:      handler,
 		ReadTimeout:  cfg.ReadTimeout.Duration,
 		WriteTimeout: cfg.WriteTimeout.Duration,
 		IdleTimeout:  cfg.IdleTimeout.Duration,
@@ -48,11 +92,20 @@ func (s *Server) registerRoutes() {
 		route := route
 		switch {
 		case route.StaticDir != "":
-			h := static.New(route)
-			s.registerPattern(route.Path, h)
+			var h http.Handler = static.New(route)
+			if gzipEnabled(route) {
+				h = gzipMiddleware(h)
+			}
+			if route.ServerName != "" {
+				s.mux.HandleFunc(route.Path, s.hostHandler(route.ServerName, h))
+				s.mux.HandleFunc(route.Path+"/", s.hostHandler(route.ServerName, h))
+			} else {
+				s.registerPattern(route.Path, h)
+			}
 			logger.Info("registered static route", logger.LogFields{
 				"path": route.Path,
 				"dir":  route.StaticDir,
+				"host": route.ServerName,
 			})
 
 		case len(route.Upstreams) > 0:
@@ -64,10 +117,20 @@ func (s *Server) registerRoutes() {
 				})
 				continue
 			}
-			s.registerPattern(route.Path, p)
+			var h http.Handler = p
+			if gzipEnabled(route) {
+				h = gzipMiddleware(h)
+			}
+			if route.ServerName != "" {
+				s.mux.HandleFunc(route.Path, s.hostHandler(route.ServerName, h))
+				s.mux.HandleFunc(route.Path+"/", s.hostHandler(route.ServerName, h))
+			} else {
+				s.registerPattern(route.Path, h)
+			}
 			logger.Info("registered proxy route", logger.LogFields{
 				"path":      route.Path,
 				"upstreams": route.Upstreams,
+				"host":      route.ServerName,
 			})
 		}
 	}
@@ -79,15 +142,55 @@ func (s *Server) registerRoutes() {
 	})
 }
 
-func (s *Server) registerPattern(path string, handler http.Handler) {
-	s.mux.Handle(path, handler)
-	if path != "/" {
-		subtree := path
-		if subtree[len(subtree)-1] != '/' {
-			subtree += "/"
+func (s *Server) hostHandler(serverName string, handler http.Handler) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Host == serverName {
+			handler.ServeHTTP(w, r)
+			return
 		}
-		s.mux.Handle(subtree, handler)
+		http.NotFound(w, r)
 	}
+}
+
+func (s *Server) registerPattern(path string, handler http.Handler) {
+	if path == "/" {
+		s.mux.Handle("/", handler)
+		return
+	}
+	s.mux.Handle(path, handler)
+	subtree := path
+	if subtree[len(subtree)-1] != '/' {
+		subtree += "/"
+	}
+	s.mux.Handle(subtree, handler)
+}
+
+func (s *Server) rateLimitMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ip := extractIP(r)
+
+		s.rlMu.RLock()
+		bucket, exists := s.rateLimits[ip]
+		s.rlMu.RUnlock()
+
+		if !exists {
+			bucket = newTokenBucket(
+				s.cfg.RateLimit.RequestsPerSecond,
+				s.cfg.RateLimit.Burst,
+			)
+			s.rlMu.Lock()
+			s.rateLimits[ip] = bucket
+			s.rlMu.Unlock()
+		}
+
+		if !bucket.allow() {
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, "too many requests", http.StatusTooManyRequests)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (s *Server) middleware(next http.Handler) http.Handler {
@@ -95,6 +198,11 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 		start := time.Now()
 
 		lrw := newResponseWriter(w)
+
+		if id := r.Header.Get("X-Request-ID"); id != "" {
+			r = r.WithContext(logger.WithRequestID(r.Context(), id))
+		}
+
 		next.ServeHTTP(lrw, r)
 
 		dur := time.Since(start)
@@ -154,6 +262,10 @@ func newResponseWriter(w http.ResponseWriter) *responseWriter {
 	return &responseWriter{ResponseWriter: w, status: http.StatusOK}
 }
 
+func (rw *responseWriter) SetUpstream(u string) {
+	rw.upstream = u
+}
+
 func (rw *responseWriter) WriteHeader(code int) {
 	if !rw.written {
 		rw.status = code
@@ -167,4 +279,51 @@ func (rw *responseWriter) Write(b []byte) (int, error) {
 		rw.WriteHeader(http.StatusOK)
 	}
 	return rw.ResponseWriter.Write(b)
+}
+
+func extractIP(r *http.Request) string {
+	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
+		if idx := strings.IndexByte(fwd, ','); idx > 0 {
+			return fwd[:idx]
+		}
+		return fwd
+	}
+	if idx := strings.LastIndexByte(r.RemoteAddr, ':'); idx > 0 {
+		return r.RemoteAddr[:idx]
+	}
+	return r.RemoteAddr
+}
+
+func gzipEnabled(route config.Route) bool {
+	if route.Gzip != nil {
+		return *route.Gzip
+	}
+	return false
+}
+
+type gzipResponseWriter struct {
+	http.ResponseWriter
+	writer *gzip.Writer
+}
+
+func (grw *gzipResponseWriter) Write(b []byte) (int, error) {
+	return grw.writer.Write(b)
+}
+
+func gzipMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		gw := gzip.NewWriter(w)
+		defer gw.Close()
+
+		w.Header().Set("Content-Encoding", "gzip")
+		w.Header().Set("Vary", "Accept-Encoding")
+
+		grw := &gzipResponseWriter{ResponseWriter: w, writer: gw}
+		next.ServeHTTP(grw, r)
+	})
 }
