@@ -219,11 +219,48 @@ docker compose --profile example up -d
 
 ## Performance
 
-- Reverse proxy adds ~0.5ms latency (p99) under load
-- Connection pooling via shared `http.Transport` (100 max idle, 10 per host)
-- Static file serving via `http.FileServer` with optional gzip and cache headers
-- Full GC control via `GOGC` and `GOMEMLIMIT` env vars
-- Atomic round-robin — no locks on the hot path
+### Benchmark results (AMD Ryzen 5 3600, Go 1.26)
+
+#### Load test (wrk — 100 concurrent connections, 4 threads)
+
+```
+Running 10s test @ http://127.0.0.1:9999/index.html
+  Latency:   1.25ms avg  (max 41.31ms, 87.78% < 1.25ms)
+  Req/Sec:   25.78k avg  (max 28.04k)
+  1,026,341 requests in 10.02s
+Requests/sec: 102,438
+Transfer/sec:  10.16 MB
+```
+
+#### Memory usage
+
+| State | Resident (RSS) |
+|---|---|
+| Idle (server loaded, no traffic) | ~7 MB |
+| After 1000 requests | ~12 MB |
+| After sustained load | ~12 MB |
+
+#### Go benchmarks
+
+| Benchmark | Ops | Latency | Allocs/op | Bytes/op |
+|---|---|---|---|---|
+| Reverse proxy (single upstream) | 14,431 | 81.4 µs | 167 | 54,839 |
+| Reverse proxy (3 upstreams, round-robin) | 14,899 | 85.2 µs | 166 | 54,703 |
+| Static file (small, 13 B) | 36,088 | 33.6 µs | 109 | 14,596 |
+| Static file (large, 256 KB) | 20,676 | 52.5 µs | 110 | 17,051 |
+| Proxy throughput (sequential) | 7,226 | 138.5 µs | 150 | 46,108 |
+| Real-world page (HTML+CSS+JS) | 7,430 | 156.5 µs | 166 | 15,398 |
+| **Heap alloc per request** | **7,467** | **143.1 µs** | **13.71 B/req** | **46,174** |
+
+> Note: Parallel benchmarks use `RunParallel` and auto-scale to GOMAXPROCS (12 cores).
+
+### Key design decisions
+
+- **Connection pooling**: `http.Transport` shared across all proxies (100 max idle, 10 per host)
+- **Pre-built ReverseProxy**: created once in `New()`, not per-request (zero allocation on hot path)
+- **Atomic round-robin**: `atomic.Uint64` — no locks on the hot path
+- **Nil-safe logger**: no panic even if logger is not initialized
+- **Full GC control**: tune with `GOGC` and `GOMEMLIMIT` env vars
 
 ## Architecture
 
