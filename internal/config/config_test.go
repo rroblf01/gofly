@@ -310,3 +310,356 @@ func TestDefault_Config(t *testing.T) {
 		t.Errorf("default port = %d, want 80", cfg.Port)
 	}
 }
+
+func TestLoad_EnvVarExpansion(t *testing.T) {
+	os.Setenv("GOFLY_TEST_DIR", "/var/www/html")
+	defer os.Unsetenv("GOFLY_TEST_DIR")
+
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+	data := `{"routes":[{"path":"/","static_dir":"${GOFLY_TEST_DIR}"}]}`
+	if err := os.WriteFile(cfgPath, []byte(data), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(cfgPath)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if cfg.Routes[0].StaticDir != "/var/www/html" {
+		t.Errorf("static_dir after expansion = %q, want %q", cfg.Routes[0].StaticDir, "/var/www/html")
+	}
+}
+
+func TestLoad_EnvVarTLS(t *testing.T) {
+	os.Setenv("GOFLY_CERT", "/tmp/cert.pem")
+	os.Setenv("GOFLY_KEY", "/tmp/key.pem")
+	defer os.Unsetenv("GOFLY_CERT")
+	defer os.Unsetenv("GOFLY_KEY")
+
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+	data := `{"tls":{"enabled":true,"cert_file":"${GOFLY_CERT}","key_file":"${GOFLY_KEY}"},"routes":[{"path":"/","upstreams":["http://localhost:8080"]}]}`
+	if err := os.WriteFile(cfgPath, []byte(data), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(cfgPath)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if cfg.TLS.CertFile != "/tmp/cert.pem" {
+		t.Errorf("cert_file after expansion = %q, want %q", cfg.TLS.CertFile, "/tmp/cert.pem")
+	}
+	if cfg.TLS.KeyFile != "/tmp/key.pem" {
+		t.Errorf("key_file after expansion = %q, want %q", cfg.TLS.KeyFile, "/tmp/key.pem")
+	}
+}
+
+func TestLoad_EnvVarSetHeaders(t *testing.T) {
+	os.Setenv("GOFLY_CORS", "https://example.com")
+	defer os.Unsetenv("GOFLY_CORS")
+
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+	data := `{"routes":[{"path":"/","upstreams":["http://localhost:3000"],"set_headers":{"Access-Control-Allow-Origin":"${GOFLY_CORS}"}}]}`
+	if err := os.WriteFile(cfgPath, []byte(data), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(cfgPath)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if cfg.Routes[0].SetHeaders["Access-Control-Allow-Origin"] != "https://example.com" {
+		t.Errorf("after expansion = %q, want %q", cfg.Routes[0].SetHeaders["Access-Control-Allow-Origin"], "https://example.com")
+	}
+}
+
+func TestLoad_MissingEnvVar(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+	data := `{"routes":[{"path":"/","upstreams":["http://localhost:8080"],"host":"${UNDEFINED_VAR}"}]}`
+	if err := os.WriteFile(cfgPath, []byte(data), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(cfgPath)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if cfg.Routes[0].Host != "" {
+		t.Errorf("undefined env var should expand to empty, got %q", cfg.Routes[0].Host)
+	}
+}
+
+func TestLoad_TLSPort(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+	data := `{"tls":{"enabled":true,"cert_file":"/tmp/cert.pem","key_file":"/tmp/key.pem"},"routes":[{"path":"/","upstreams":["http://localhost:8080"]}]}`
+	if err := os.WriteFile(cfgPath, []byte(data), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(cfgPath)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if cfg.TLS.TLSPort != 0 {
+		t.Errorf("TLSPort should default to 0 (meaning 443 at runtime), got %d", cfg.TLS.TLSPort)
+	}
+}
+
+func TestLoad_CustomTLSPort(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+	data := `{"tls":{"enabled":true,"cert_file":"/tmp/cert.pem","key_file":"/tmp/key.pem","tls_port":8443},"routes":[{"path":"/","upstreams":["http://localhost:8080"]}]}`
+	if err := os.WriteFile(cfgPath, []byte(data), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(cfgPath)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if cfg.TLS.TLSPort != 8443 {
+		t.Errorf("TLSPort = %d, want %d", cfg.TLS.TLSPort, 8443)
+	}
+}
+
+func TestLoad_SPAFlag(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+	data := `{"routes":[{"path":"/","static_dir":"/www","spa":true}]}`
+	if err := os.WriteFile(cfgPath, []byte(data), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(cfgPath)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if !cfg.Routes[0].SPA {
+		t.Error("SPA should be true")
+	}
+}
+
+func TestLoad_SPAFlagDefault(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+	data := `{"routes":[{"path":"/","static_dir":"/www"}]}`
+	if err := os.WriteFile(cfgPath, []byte(data), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(cfgPath)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if cfg.Routes[0].SPA {
+		t.Error("SPA should default to false")
+	}
+}
+
+func TestLoad_AutoIndex(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+	data := `{"routes":[{"path":"/","static_dir":"/www","autoindex":true}]}`
+	if err := os.WriteFile(cfgPath, []byte(data), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(cfgPath)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if !cfg.Routes[0].AutoIndex {
+		t.Error("AutoIndex should be true")
+	}
+}
+
+func TestLoad_ErrorPages(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+	data := `{"routes":[{"path":"/","static_dir":"/www","error_pages":{"404":"/404.html","500":"/500.html"}}]}`
+	if err := os.WriteFile(cfgPath, []byte(data), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(cfgPath)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if cfg.Routes[0].ErrorPages[404] != "/404.html" {
+		t.Errorf("error_pages[404] = %q, want %q", cfg.Routes[0].ErrorPages[404], "/404.html")
+	}
+	if cfg.Routes[0].ErrorPages[500] != "/500.html" {
+		t.Errorf("error_pages[500] = %q, want %q", cfg.Routes[0].ErrorPages[500], "/500.html")
+	}
+}
+
+func TestLoad_ErrorPagesEnvVar(t *testing.T) {
+	os.Setenv("GOFLY_404", "/custom_404.html")
+	defer os.Unsetenv("GOFLY_404")
+
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+	data := `{"routes":[{"path":"/","static_dir":"/www","error_pages":{"404":"${GOFLY_404}"}}]}`
+	if err := os.WriteFile(cfgPath, []byte(data), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(cfgPath)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if cfg.Routes[0].ErrorPages[404] != "/custom_404.html" {
+		t.Errorf("error_pages[404] after expansion = %q, want %q", cfg.Routes[0].ErrorPages[404], "/custom_404.html")
+	}
+}
+
+func TestLoad_SecurityHeadersTrue(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+	data := `{"routes":[{"path":"/","static_dir":"/www","security_headers":true}]}`
+	if err := os.WriteFile(cfgPath, []byte(data), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(cfgPath)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if cfg.Routes[0].SecurityHeaders == nil || !*cfg.Routes[0].SecurityHeaders {
+		t.Error("SecurityHeaders should be true")
+	}
+}
+
+func TestLoad_SecurityHeadersFalse(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+	data := `{"routes":[{"path":"/","static_dir":"/www","security_headers":false}]}`
+	if err := os.WriteFile(cfgPath, []byte(data), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(cfgPath)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if cfg.Routes[0].SecurityHeaders == nil || *cfg.Routes[0].SecurityHeaders {
+		t.Error("SecurityHeaders should be false")
+	}
+}
+
+func TestAccessLogEnabled(t *testing.T) {
+	cfg := Default()
+	if !cfg.AccessLogEnabled() {
+		t.Error("AccessLogEnabled should default to true")
+	}
+
+	disabled := false
+	cfg.AccessLog = &disabled
+	if cfg.AccessLogEnabled() {
+		t.Error("AccessLogEnabled should be false when access_log=false")
+	}
+
+	enabled := true
+	cfg.AccessLog = &enabled
+	if !cfg.AccessLogEnabled() {
+		t.Error("AccessLogEnabled should be true when access_log=true")
+	}
+}
+
+func TestSecurityHeadersDefault(t *testing.T) {
+	r := Route{Path: "/", StaticDir: "/www"}
+	if !r.SecurityHeadersDefault() {
+		t.Error("SecurityHeadersDefault should default to true")
+	}
+
+	disabled := false
+	r.SecurityHeaders = &disabled
+	if r.SecurityHeadersDefault() {
+		t.Error("SecurityHeadersDefault should be false when security_headers=false")
+	}
+
+	enabled := true
+	r.SecurityHeaders = &enabled
+	if !r.SecurityHeadersDefault() {
+		t.Error("SecurityHeadersDefault should be true when security_headers=true")
+	}
+}
+
+func TestSecurityHeadersEnabled(t *testing.T) {
+	cfg := Default()
+	if cfg.SecurityHeadersEnabled() {
+		t.Error("SecurityHeadersEnabled should be false with no routes")
+	}
+
+	cfg.Routes = []Route{{Path: "/", StaticDir: "/www"}}
+	if !cfg.SecurityHeadersEnabled() {
+		t.Error("SecurityHeadersEnabled should be true when routes have default security headers")
+	}
+
+	disabled := false
+	cfg.Routes = []Route{{Path: "/", StaticDir: "/www", SecurityHeaders: &disabled}}
+	if cfg.SecurityHeadersEnabled() {
+		t.Error("SecurityHeadersEnabled should be false when all routes have security_headers=false")
+	}
+
+	cfg.Routes = []Route{{Path: "/", StaticDir: "/www", SecurityHeaders: &disabled}}
+	cfg.Routes = append(cfg.Routes, Route{Path: "/api", StaticDir: "/api"})
+	if !cfg.SecurityHeadersEnabled() {
+		t.Error("SecurityHeadersEnabled should be true when any route has default (nil) security headers")
+	}
+}
+
+func TestEffectiveMaxBodySize_ZeroDefault(t *testing.T) {
+	r := Route{Path: "/", Upstreams: []string{"http://localhost:8080"}}
+	if s := r.EffectiveMaxBodySize(0); s != 0 {
+		t.Errorf("effective = %d, want 0", s)
+	}
+}
+
+func TestEffectiveMaxBodySize_RouteOverride(t *testing.T) {
+	r := Route{Path: "/", Upstreams: []string{"http://localhost:8080"}, MaxBodySize: 1000}
+	if s := r.EffectiveMaxBodySize(500); s != 1000 {
+		t.Errorf("effective = %d, want 1000", s)
+	}
+
+	r.MaxBodySize = 0
+	if s := r.EffectiveMaxBodySize(500); s != 500 {
+		t.Errorf("effective = %d, want 500", s)
+	}
+}
+
+func TestLoad_SetHeadersOnStatic(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+	data := `{"routes":[{"path":"/","static_dir":"/www","set_headers":{"X-Custom":"value"}}]}`
+	if err := os.WriteFile(cfgPath, []byte(data), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(cfgPath)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if cfg.Routes[0].SetHeaders["X-Custom"] != "value" {
+		t.Errorf("set_headers on static = %q, want %q", cfg.Routes[0].SetHeaders["X-Custom"], "value")
+	}
+}

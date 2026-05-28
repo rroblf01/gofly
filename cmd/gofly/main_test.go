@@ -14,9 +14,6 @@ import (
 	"github.com/rroblf01/gofly/internal/logger"
 )
 
-// run duplicates main()'s logic but returns (exitCode, stdout) instead of
-// calling os.Exit or writing directly to os.Stdout. It resets flag state so
-// each call is isolated.
 func run(args []string, environ map[string]string) (exitCode int, stdout string) {
 	prevArgs := os.Args
 	prevStdout := os.Stdout
@@ -52,10 +49,11 @@ func run(args []string, environ map[string]string) (exitCode int, stdout string)
 
 	flag.CommandLine = flag.NewFlagSet(os.Args[0], flag.ContinueOnError)
 
-	configPath := flag.String("config", "/etc/gofly/config.json", "")
+	configPath := flag.String("config", "", "")
 	port := flag.Int("port", 0, "")
 	debug := flag.Bool("debug", false, "")
 	showVersion := flag.Bool("version", false, "")
+	root := flag.String("root", "", "")
 	flag.Parse()
 
 	if *showVersion {
@@ -71,25 +69,43 @@ func run(args []string, environ map[string]string) (exitCode int, stdout string)
 		logger.InitDebug()
 	}
 
-	path := *configPath
-	if env := os.Getenv("GOFLY_CONFIG"); env != "" {
-		path = env
-	}
+	var cfg config.Config
 
-	cfg, err := config.Load(path)
-	if err != nil {
-		logger.Error("failed to load config", logger.LogFields{
-			"path":  path,
-			"error": err.Error(),
-		})
-		exitCode = 1
-	} else {
+	if *root != "" {
+		cfg = config.Default()
 		if *port > 0 {
 			cfg.Port = *port
 		}
-		_ = cfg
+		cfg.Routes = []config.Route{
+			{Path: "/", StaticDir: *root},
+		}
 		exitCode = 0
+	} else {
+		path := *configPath
+		if path == "" {
+			path = "/etc/gofly/config.json"
+		}
+		if env := os.Getenv("GOFLY_CONFIG"); env != "" {
+			path = env
+		}
+
+		var err error
+		cfg, err = config.Load(path)
+		if err != nil {
+			logger.Error("failed to load config", logger.LogFields{
+				"path":  path,
+				"error": err.Error(),
+			})
+			exitCode = 1
+		} else {
+			if *port > 0 {
+				cfg.Port = *port
+			}
+			exitCode = 0
+		}
 	}
+
+	_ = cfg
 
 	pw.Close()
 	var buf bytes.Buffer
@@ -137,5 +153,40 @@ func TestMain_ConfigFromEnv(t *testing.T) {
 	code, _ := run([]string{"gofly"}, map[string]string{"GOFLY_CONFIG": cfgPath})
 	if code != 0 {
 		t.Fatalf("expected exit code 0 when config loaded from env, got %d", code)
+	}
+}
+
+func TestMain_RootFlag(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(dir+"/index.html", []byte("root mode"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	code, _ := run([]string{"gofly", "-root", dir}, nil)
+	if code != 0 {
+		t.Fatalf("expected exit code 0 for -root, got %d", code)
+	}
+}
+
+func TestMain_RootWithPort(t *testing.T) {
+	dir := t.TempDir()
+	code, _ := run([]string{"gofly", "-root", dir, "-port", "8080"}, nil)
+	if code != 0 {
+		t.Fatalf("expected exit code 0 for -root with -port, got %d", code)
+	}
+}
+
+func TestMain_RootAndConfig(t *testing.T) {
+	dir := t.TempDir()
+	code, _ := run([]string{"gofly", "-root", dir, "-config", "/nonexistent"}, nil)
+	if code != 0 {
+		t.Fatalf("expected exit code 0 when -root is set regardless of -config, got %d", code)
+	}
+}
+
+func TestMain_ConfiglessInvalidRoot(t *testing.T) {
+	code, _ := run([]string{"gofly", "-root", "/nonexistent/directory"}, nil)
+	if code != 0 {
+		t.Fatalf("expected exit code 0 even with nonexistent root (runtime will handle), got %d", code)
 	}
 }

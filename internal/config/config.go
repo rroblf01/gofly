@@ -7,6 +7,8 @@ import (
 	"time"
 )
 
+const DefaultMemoryLimit int64 = 100 << 20 // 100 MB
+
 type Config struct {
 	Port         int        `json:"port"`
 	Workers      int        `json:"workers,omitempty"`
@@ -17,6 +19,7 @@ type Config struct {
 	RateLimit    *RateLimit `json:"rate_limit,omitempty"`
 	TLS          *TLSConfig `json:"tls,omitempty"`
 	AccessLog    *bool      `json:"access_log,omitempty"`
+	MemoryLimit  int64      `json:"memory_limit,omitempty"`
 	Routes       []Route    `json:"routes"`
 }
 
@@ -29,25 +32,30 @@ type TLSConfig struct {
 	Enabled  bool   `json:"enabled"`
 	CertFile string `json:"cert_file"`
 	KeyFile  string `json:"key_file"`
+	TLSPort  int    `json:"tls_port,omitempty"`
 }
 
 type Route struct {
-	Path            string            `json:"path"`
-	Host            string            `json:"host,omitempty"`
-	ServerName      string            `json:"server_name,omitempty"`
-	Upstreams       []string          `json:"upstreams,omitempty"`
-	Strategy        string            `json:"strategy,omitempty"`
-	SetHeaders      map[string]string `json:"set_headers,omitempty"`
-	RemoveHeaders   []string          `json:"remove_headers,omitempty"`
-	StaticDir       string            `json:"static_dir,omitempty"`
-	BrowserCacheTTL *Duration         `json:"browser_cache_ttl,omitempty"`
-	Rewrite         string            `json:"rewrite,omitempty"`
-	UpstreamTimeout *Duration         `json:"upstream_timeout,omitempty"`
-	RetryOnError    bool              `json:"retry_on_error,omitempty"`
-	MaxBodySize     int64             `json:"max_body_size,omitempty"`
-	MaxFails        int               `json:"max_fails,omitempty"`
-	FailTimeout     *Duration         `json:"fail_timeout,omitempty"`
-	Gzip            *bool             `json:"gzip,omitempty"`
+	Path          string            `json:"path"`
+	Host          string            `json:"host,omitempty"`
+	ServerName    string            `json:"server_name,omitempty"`
+	Upstreams     []string          `json:"upstreams,omitempty"`
+	Strategy      string            `json:"strategy,omitempty"`
+	SetHeaders    map[string]string `json:"set_headers,omitempty"`
+	RemoveHeaders []string          `json:"remove_headers,omitempty"`
+	StaticDir     string            `json:"static_dir,omitempty"`
+	BrowserCacheTTL *Duration       `json:"browser_cache_ttl,omitempty"`
+	Rewrite       string            `json:"rewrite,omitempty"`
+	UpstreamTimeout *Duration       `json:"upstream_timeout,omitempty"`
+	RetryOnError  bool              `json:"retry_on_error,omitempty"`
+	MaxBodySize   int64             `json:"max_body_size,omitempty"`
+	MaxFails      int               `json:"max_fails,omitempty"`
+	FailTimeout   *Duration         `json:"fail_timeout,omitempty"`
+	Gzip          *bool             `json:"gzip,omitempty"`
+	SPA           bool              `json:"spa,omitempty"`
+	AutoIndex     bool              `json:"autoindex,omitempty"`
+	ErrorPages    map[int]string    `json:"error_pages,omitempty"`
+	SecurityHeaders *bool           `json:"security_headers,omitempty"`
 }
 
 type Duration struct {
@@ -92,11 +100,41 @@ func Load(path string) (Config, error) {
 		return cfg, fmt.Errorf("parse config: %w", err)
 	}
 
+	cfg.expandEnv()
+
 	if err := cfg.validate(); err != nil {
 		return cfg, fmt.Errorf("validate config: %w", err)
 	}
 
 	return cfg, nil
+}
+
+func (c *Config) expandEnv() {
+	for i := range c.Routes {
+		c.Routes[i].Path = os.Expand(c.Routes[i].Path, os.Getenv)
+		c.Routes[i].Host = os.Expand(c.Routes[i].Host, os.Getenv)
+		c.Routes[i].ServerName = os.Expand(c.Routes[i].ServerName, os.Getenv)
+		c.Routes[i].StaticDir = os.Expand(c.Routes[i].StaticDir, os.Getenv)
+		c.Routes[i].Rewrite = os.Expand(c.Routes[i].Rewrite, os.Getenv)
+		if c.Routes[i].SetHeaders != nil {
+			expanded := make(map[string]string, len(c.Routes[i].SetHeaders))
+			for k, v := range c.Routes[i].SetHeaders {
+				expanded[os.Expand(k, os.Getenv)] = os.Expand(v, os.Getenv)
+			}
+			c.Routes[i].SetHeaders = expanded
+		}
+		if c.Routes[i].ErrorPages != nil {
+			expanded := make(map[int]string, len(c.Routes[i].ErrorPages))
+			for k, v := range c.Routes[i].ErrorPages {
+				expanded[k] = os.Expand(v, os.Getenv)
+			}
+			c.Routes[i].ErrorPages = expanded
+		}
+	}
+	if c.TLS != nil {
+		c.TLS.CertFile = os.Expand(c.TLS.CertFile, os.Getenv)
+		c.TLS.KeyFile = os.Expand(c.TLS.KeyFile, os.Getenv)
+	}
 }
 
 func (c *Config) validate() error {
@@ -143,9 +181,29 @@ func (c *Config) AccessLogEnabled() bool {
 	return c.AccessLog == nil || *c.AccessLog
 }
 
+func (c *Config) EffectiveMemoryLimit() int64 {
+	if c.MemoryLimit > 0 {
+		return c.MemoryLimit
+	}
+	return DefaultMemoryLimit
+}
+
+func (c *Config) SecurityHeadersEnabled() bool {
+	for _, r := range c.Routes {
+		if r.SecurityHeaders == nil || *r.SecurityHeaders {
+			return true
+		}
+	}
+	return false
+}
+
 func (r *Route) EffectiveMaxBodySize(defaultSize int64) int64 {
 	if r.MaxBodySize > 0 {
 		return r.MaxBodySize
 	}
 	return defaultSize
+}
+
+func (r *Route) SecurityHeadersDefault() bool {
+	return r.SecurityHeaders == nil || *r.SecurityHeaders
 }

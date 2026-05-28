@@ -10,8 +10,10 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -32,6 +34,7 @@ type logEntry struct {
 
 type Server struct {
 	cfg        config.Config
+	configPath string
 	http       *http.Server
 	mux        *http.ServeMux
 	rateLimits map[string]*tokenBucket
@@ -40,6 +43,25 @@ type Server struct {
 	logWg      sync.WaitGroup
 	stopLog    chan struct{}
 	listeners  []net.Listener
+	sh         *swappableHandler
+}
+
+type swappableHandler struct {
+	mu      sync.RWMutex
+	handler atomic.Value
+}
+
+func (sh *swappableHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	sh.mu.RLock()
+	h := sh.handler.Load().(http.Handler)
+	sh.mu.RUnlock()
+	h.ServeHTTP(w, r)
+}
+
+func (sh *swappableHandler) Swap(h http.Handler) {
+	sh.mu.Lock()
+	sh.handler.Store(h)
+	sh.mu.Unlock()
 }
 
 type tokenBucket struct {
@@ -89,10 +111,7 @@ func New(cfg config.Config) *Server {
 	s.registerRoutes()
 	s.startLogWorker()
 
-	handler := s.middleware(mux)
-	if cfg.RateLimit != nil {
-		handler = s.rateLimitMiddleware(handler)
-	}
+	handler := s.buildMiddleware(mux)
 
 	s.http = &http.Server{
 		Addr:         fmt.Sprintf(":%d", cfg.Port),
@@ -103,6 +122,33 @@ func New(cfg config.Config) *Server {
 	}
 
 	return s
+}
+
+func (s *Server) buildMiddleware(mux *http.ServeMux) http.Handler {
+	sh := &swappableHandler{}
+	s.sh = sh
+	var handler http.Handler = mux
+	handler = s.middleware(handler)
+	if s.cfg.RateLimit != nil {
+		handler = s.rateLimitMiddleware(handler)
+	}
+	sh.Swap(handler)
+	return sh
+}
+
+func (s *Server) rebuildHandler() {
+	mux := http.NewServeMux()
+	s.mux = mux
+	s.registerRoutes()
+
+	handler := http.Handler(mux)
+	handler = s.middleware(handler)
+	if s.cfg.RateLimit != nil {
+		s.rateLimits = make(map[string]*tokenBucket)
+		handler = s.rateLimitMiddleware(handler)
+	}
+
+	s.sh.Swap(handler)
 }
 
 func (s *Server) registerRoutes() {
@@ -259,27 +305,36 @@ func (s *Server) ListenAndServe() error {
 		workers = 1
 	}
 
-	addr := fmt.Sprintf(":%d", s.cfg.Port)
+	errCh := make(chan error, workers*2)
 
+	httpAddr := fmt.Sprintf(":%d", s.cfg.Port)
 	for i := 0; i < workers; i++ {
-		l, err := listen("tcp", addr)
+		l, err := listen("tcp", httpAddr)
 		if err != nil {
 			return err
 		}
 		s.listeners = append(s.listeners, l)
+		go func() {
+			errCh <- s.http.Serve(l)
+		}()
 	}
 
-	errCh := make(chan error, len(s.listeners))
-
-	for _, l := range s.listeners {
-		l := l
-		go func() {
-			if s.cfg.TLS != nil && s.cfg.TLS.Enabled {
-				errCh <- s.http.ServeTLS(l, s.cfg.TLS.CertFile, s.cfg.TLS.KeyFile)
-			} else {
-				errCh <- s.http.Serve(l)
+	if s.cfg.TLS != nil && s.cfg.TLS.Enabled {
+		tlsPort := s.cfg.TLS.TLSPort
+		if tlsPort == 0 {
+			tlsPort = 443
+		}
+		tlsAddr := fmt.Sprintf(":%d", tlsPort)
+		for i := 0; i < workers; i++ {
+			l, err := listen("tcp", tlsAddr)
+			if err != nil {
+				return err
 			}
-		}()
+			s.listeners = append(s.listeners, l)
+			go func() {
+				errCh <- s.http.ServeTLS(l, s.cfg.TLS.CertFile, s.cfg.TLS.KeyFile)
+			}()
+		}
 	}
 
 	err := <-errCh
@@ -303,14 +358,22 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	return err
 }
 
-func Run(cfg config.Config) error {
+func Run(cfg config.Config, configPath string) error {
+	limit := cfg.EffectiveMemoryLimit()
+	debug.SetMemoryLimit(limit)
+	logger.Info("memory limit set", logger.LogFields{
+		"limit_bytes": limit,
+		"limit_mb":    limit >> 20,
+	})
+
 	srv := New(cfg)
+	srv.configPath = configPath
 
 	errCh := make(chan error, 1)
 	go func() {
 		logger.Info("starting server", logger.LogFields{
-			"port":   cfg.Port,
-			"tls":    cfg.TLS != nil && cfg.TLS.Enabled,
+			"port":    cfg.Port,
+			"tls":     cfg.TLS != nil && cfg.TLS.Enabled,
 			"workers": cfg.Workers,
 		})
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -318,20 +381,33 @@ func Run(cfg config.Config) error {
 		}
 	}()
 
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 
-	select {
-	case err := <-errCh:
-		return err
-	case sig := <-quit:
-		logger.Info("shutting down", logger.LogFields{"signal": sig.String()})
+	for {
+		select {
+		case err := <-errCh:
+			return err
+		case sig := <-sigCh:
+			switch sig {
+			case syscall.SIGHUP:
+				logger.Info("reloading config", logger.LogFields{"path": configPath})
+				newCfg, err := config.Load(configPath)
+				if err != nil {
+					logger.Error("config reload failed", logger.LogFields{"error": err.Error()})
+					continue
+				}
+				srv.cfg = newCfg
+				srv.rebuildHandler()
+				logger.Info("config reloaded", logger.LogFields{})
+			default:
+				logger.Info("shutting down", logger.LogFields{"signal": sig.String()})
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				return srv.Shutdown(ctx)
+			}
+		}
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	return srv.Shutdown(ctx)
 }
 
 type responseWriter struct {

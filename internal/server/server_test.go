@@ -385,3 +385,152 @@ func TestHostBasedRouting(t *testing.T) {
 		}
 	})
 }
+
+func TestSwappableHandler(t *testing.T) {
+	var calls1, calls2 int
+	h1 := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls1++
+		w.WriteHeader(http.StatusOK)
+	})
+	h2 := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls2++
+		w.WriteHeader(http.StatusTeapot)
+	})
+
+	sh := &swappableHandler{}
+	sh.Swap(h1)
+
+	rec := httptest.NewRecorder()
+	sh.ServeHTTP(rec, httptest.NewRequest("GET", "/", nil))
+	if rec.Code != http.StatusOK {
+		t.Errorf("initial handler status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	if calls1 != 1 {
+		t.Errorf("h1 should have been called once, got %d calls", calls1)
+	}
+
+	sh.Swap(h2)
+	rec2 := httptest.NewRecorder()
+	sh.ServeHTTP(rec2, httptest.NewRequest("GET", "/", nil))
+	if rec2.Code != http.StatusTeapot {
+		t.Errorf("after swap status = %d, want %d", rec2.Code, http.StatusTeapot)
+	}
+	if calls2 != 1 {
+		t.Errorf("h2 should have been called once, got %d calls", calls2)
+	}
+	if calls1 != 1 {
+		t.Errorf("h1 should still have been called once after swap, got %d calls", calls1)
+	}
+}
+
+func TestServer_StaticRouteWithSetHeaders(t *testing.T) {
+	dir := t.TempDir()
+	if err := writeFile(dir+"/index.html", "cors test", 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := config.Config{
+		Port: 0,
+		Routes: []config.Route{
+			{
+				Path:        "/",
+				StaticDir:   dir,
+				SetHeaders:  map[string]string{"Access-Control-Allow-Origin": "*"},
+			},
+		},
+	}
+
+	srv := New(cfg)
+	ts := &http.Server{
+		Addr:    ":0",
+		Handler: srv.middleware(srv.mux),
+	}
+	listener, err := net.Listen("tcp", ":0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	go ts.Serve(listener)
+	defer ts.Close()
+
+	resp, err := http.Get("http://" + listener.Addr().String() + "/index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	cors := resp.Header.Get("Access-Control-Allow-Origin")
+	if cors != "*" {
+		t.Errorf("Access-Control-Allow-Origin = %q, want %q", cors, "*")
+	}
+}
+
+func TestServer_ConfiglessMode(t *testing.T) {
+	dir := t.TempDir()
+	if err := writeFile(dir+"/index.html", "configless", 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := config.Config{
+		Port:    0,
+		Workers: 1,
+		Routes: []config.Route{
+			{Path: "/", StaticDir: dir},
+		},
+	}
+
+	srv := New(cfg)
+	listener, err := net.Listen("tcp", ":0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	go srv.http.Serve(listener)
+	defer srv.http.Close()
+
+	time.Sleep(50 * time.Millisecond)
+
+	resp, err := http.Get("http://" + listener.Addr().String() + "/index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "configless" {
+		t.Errorf("body = %q, want %q", string(body), "configless")
+	}
+}
+
+func TestServer_EmptyRoutes(t *testing.T) {
+	cfg := config.Config{
+		Port:   0,
+		Routes: []config.Route{},
+	}
+
+	srv := New(cfg)
+	listener, err := net.Listen("tcp", ":0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	go srv.http.Serve(listener)
+	defer srv.http.Close()
+
+	resp, err := http.Get("http://" + listener.Addr().String() + "/health")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("health endpoint status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+}

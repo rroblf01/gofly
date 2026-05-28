@@ -1,10 +1,13 @@
 package static
 
 import (
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -20,12 +23,7 @@ func TestStatic_ServesFile(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	route := config.Route{
-		Path:      "/",
-		StaticDir: dir,
-	}
-
-	h := New(route)
+	h := New(config.Route{Path: "/", StaticDir: dir})
 
 	resp := httptest.NewRecorder()
 	req := httptest.NewRequest("GET", "/test.txt", nil)
@@ -49,12 +47,7 @@ func TestStatic_ServesIndexHTML(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	route := config.Route{
-		Path:      "/",
-		StaticDir: dir,
-	}
-
-	h := New(route)
+	h := New(config.Route{Path: "/", StaticDir: dir})
 
 	resp := httptest.NewRecorder()
 	req := httptest.NewRequest("GET", "/", nil)
@@ -79,13 +72,10 @@ func TestStatic_CacheControl(t *testing.T) {
 	}
 
 	dur := config.Duration{Duration: 3600 * time.Second}
-	route := config.Route{
-		Path:            "/",
-		StaticDir:       dir,
+	h := New(config.Route{
+		Path: "/", StaticDir: dir,
 		BrowserCacheTTL: &dur,
-	}
-
-	h := New(route)
+	})
 
 	resp := httptest.NewRecorder()
 	req := httptest.NewRequest("GET", "/test.txt", nil)
@@ -105,12 +95,7 @@ func TestStatic_NoCacheControl(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	route := config.Route{
-		Path:      "/",
-		StaticDir: dir,
-	}
-
-	h := New(route)
+	h := New(config.Route{Path: "/", StaticDir: dir})
 
 	resp := httptest.NewRecorder()
 	req := httptest.NewRequest("GET", "/test.txt", nil)
@@ -122,116 +107,6 @@ func TestStatic_NoCacheControl(t *testing.T) {
 	}
 }
 
-func TestStatic_PathTraversalBasic(t *testing.T) {
-	logger.Init()
-
-	dir := t.TempDir()
-	route := config.Route{
-		Path:      "/",
-		StaticDir: dir,
-	}
-
-	h := New(route)
-
-	resp := httptest.NewRecorder()
-	req := httptest.NewRequest("GET", "/../etc/passwd", nil)
-	h.ServeHTTP(resp, req)
-
-	if resp.Code != http.StatusForbidden {
-		t.Errorf("status = %d, want %d", resp.Code, http.StatusForbidden)
-	}
-}
-
-func TestStatic_PathTraversalDoubleDot(t *testing.T) {
-	logger.Init()
-
-	dir := t.TempDir()
-	route := config.Route{
-		Path:      "/",
-		StaticDir: dir,
-	}
-
-	h := New(route)
-
-	resp := httptest.NewRecorder()
-	req := httptest.NewRequest("GET", "/../../etc/passwd", nil)
-	h.ServeHTTP(resp, req)
-
-	if resp.Code != http.StatusForbidden {
-		t.Errorf("status = %d, want %d", resp.Code, http.StatusForbidden)
-	}
-}
-
-func TestStatic_PathTraversalURLEncoded(t *testing.T) {
-	logger.Init()
-
-	dir := t.TempDir()
-	route := config.Route{
-		Path:      "/",
-		StaticDir: dir,
-	}
-
-	h := New(route)
-
-	resp := httptest.NewRecorder()
-	req := httptest.NewRequest("GET", "/%2e%2e/etc/passwd", nil)
-	h.ServeHTTP(resp, req)
-
-	if resp.Code != http.StatusForbidden {
-		t.Errorf("status = %d, want %d", resp.Code, http.StatusForbidden)
-	}
-}
-
-func TestStatic_PathTraversalDeeplyNested(t *testing.T) {
-	logger.Init()
-
-	dir := t.TempDir()
-	os.MkdirAll(dir+"/sub/deep", 0755)
-	if err := os.WriteFile(dir+"/sub/deep/file.txt", []byte("safe"), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	route := config.Route{
-		Path:      "/",
-		StaticDir: dir,
-	}
-
-	h := New(route)
-
-	resp := httptest.NewRecorder()
-	req := httptest.NewRequest("GET", "/sub/deep/file.txt", nil)
-	h.ServeHTTP(resp, req)
-
-	if resp.Code != http.StatusOK {
-		t.Errorf("status = %d, want %d", resp.Code, http.StatusOK)
-	}
-
-	body, _ := io.ReadAll(resp.Body)
-	if string(body) != "safe" {
-		t.Errorf("body = %q, want %q", string(body), "safe")
-	}
-}
-
-func TestStatic_FileNotFound(t *testing.T) {
-	logger.Init()
-
-	dir := t.TempDir()
-	route := config.Route{
-		Path:      "/",
-		StaticDir: dir,
-	}
-
-	h := New(route)
-
-	resp := httptest.NewRecorder()
-	req := httptest.NewRequest("GET", "/nonexistent.txt", nil)
-	h.ServeHTTP(resp, req)
-
-	if resp.Code != http.StatusNotFound {
-		t.Errorf("status = %d, want %d", resp.Code, http.StatusNotFound)
-	}
-}
-
 func TestStatic_ContentType(t *testing.T) {
 	logger.Init()
 
@@ -240,12 +115,7 @@ func TestStatic_ContentType(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	route := config.Route{
-		Path:      "/",
-		StaticDir: dir,
-	}
-
-	h := New(route)
+	h := New(config.Route{Path: "/", StaticDir: dir})
 
 	resp := httptest.NewRecorder()
 	req := httptest.NewRequest("GET", "/style.css", nil)
@@ -261,16 +131,121 @@ func TestStatic_ContentType(t *testing.T) {
 	}
 }
 
+func TestStatic_FileNotFound(t *testing.T) {
+	logger.Init()
+
+	dir := t.TempDir()
+	h := New(config.Route{Path: "/", StaticDir: dir})
+
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/nonexistent.txt", nil)
+	h.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want %d", resp.Code, http.StatusNotFound)
+	}
+}
+
+func TestStatic_PathTraversal(t *testing.T) {
+	logger.Init()
+
+	dir := t.TempDir()
+	h := New(config.Route{Path: "/", StaticDir: dir})
+
+	tests := []string{
+		"/../etc/passwd",
+		"/../../etc/passwd",
+		"/%2e%2e/etc/passwd",
+	}
+	for _, p := range tests {
+		t.Run(p, func(t *testing.T) {
+			resp := httptest.NewRecorder()
+			req := httptest.NewRequest("GET", p, nil)
+			h.ServeHTTP(resp, req)
+			if resp.Code != http.StatusForbidden {
+				t.Errorf("path %q: status = %d, want %d", p, resp.Code, http.StatusForbidden)
+			}
+		})
+	}
+}
+
+func TestStatic_SafePath(t *testing.T) {
+	logger.Init()
+
+	dir := t.TempDir()
+	os.MkdirAll(dir+"/sub/deep", 0755)
+	if err := os.WriteFile(dir+"/sub/deep/file.txt", []byte("safe"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	h := New(config.Route{Path: "/", StaticDir: dir})
+
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/sub/deep/file.txt", nil)
+	h.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d", resp.Code, http.StatusOK)
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "safe" {
+		t.Errorf("body = %q, want %q", string(body), "safe")
+	}
+}
+
+func TestStatic_PrefixStripping(t *testing.T) {
+	logger.Init()
+
+	dir := t.TempDir()
+	if err := os.WriteFile(dir+"/file.txt", []byte("prefix test"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	h := New(config.Route{Path: "/static", StaticDir: dir})
+
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/static/file.txt", nil)
+	h.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d", resp.Code, http.StatusOK)
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "prefix test" {
+		t.Errorf("body = %q, want %q", string(body), "prefix test")
+	}
+}
+
+func TestStatic_TrailingSlashRedirect(t *testing.T) {
+	logger.Init()
+
+	dir := t.TempDir()
+	if err := os.MkdirAll(dir+"/subdir", 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	h := New(config.Route{Path: "/", StaticDir: dir})
+
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/subdir", nil)
+	h.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusMovedPermanently {
+		t.Errorf("status = %d, want %d", resp.Code, http.StatusMovedPermanently)
+	}
+	loc := resp.Header().Get("Location")
+	if loc != "/subdir/" {
+		t.Errorf("Location = %q, want %q", loc, "/subdir/")
+	}
+}
+
 func TestStatic_SafePathInRoot(t *testing.T) {
 	logger.Init()
 
 	dir := t.TempDir()
-	route := config.Route{
-		Path:      "/",
-		StaticDir: dir,
-	}
-
-	h := New(route)
+	h := New(config.Route{Path: "/", StaticDir: dir})
 
 	resp := httptest.NewRecorder()
 	req := httptest.NewRequest("GET", "/", nil)
@@ -278,5 +253,817 @@ func TestStatic_SafePathInRoot(t *testing.T) {
 
 	if resp.Code != http.StatusOK && resp.Code != http.StatusNotFound {
 		t.Errorf("unexpected status: %d", resp.Code)
+	}
+}
+
+func TestStatic_ETag(t *testing.T) {
+	logger.Init()
+
+	dir := t.TempDir()
+	if err := os.WriteFile(dir+"/test.txt", []byte("etag test"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	h := New(config.Route{Path: "/", StaticDir: dir})
+
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/test.txt", nil)
+	h.ServeHTTP(resp, req)
+
+	etag := resp.Header().Get("ETag")
+	if etag == "" {
+		t.Fatal("ETag header not set")
+	}
+	if !strings.HasPrefix(etag, `"`) || !strings.HasSuffix(etag, `"`) {
+		t.Errorf("ETag %q should be quoted", etag)
+	}
+}
+
+func TestStatic_IfNoneMatch304(t *testing.T) {
+	logger.Init()
+
+	dir := t.TempDir()
+	if err := os.WriteFile(dir+"/test.txt", []byte("304 test"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	stat, _ := os.Stat(dir + "/test.txt")
+	expectedEtag := fmt.Sprintf(`"%x-%x"`, stat.ModTime().Unix(), stat.Size())
+
+	h := New(config.Route{Path: "/", StaticDir: dir})
+
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/test.txt", nil)
+	req.Header.Set("If-None-Match", expectedEtag)
+	h.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusNotModified {
+		t.Errorf("status = %d, want %d", resp.Code, http.StatusNotModified)
+	}
+	if resp.Body.Len() > 0 {
+		t.Errorf("304 response should have empty body, got %d bytes", resp.Body.Len())
+	}
+}
+
+func TestStatic_IfNoneMatchStar(t *testing.T) {
+	logger.Init()
+
+	dir := t.TempDir()
+	if err := os.WriteFile(dir+"/test.txt", []byte("star test"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	h := New(config.Route{Path: "/", StaticDir: dir})
+
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/test.txt", nil)
+	req.Header.Set("If-None-Match", "*")
+	h.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusNotModified {
+		t.Errorf("status = %d, want %d", resp.Code, http.StatusNotModified)
+	}
+}
+
+func TestStatic_IfNoneMatch200(t *testing.T) {
+	logger.Init()
+
+	dir := t.TempDir()
+	if err := os.WriteFile(dir+"/test.txt", []byte("mismatch"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	h := New(config.Route{Path: "/", StaticDir: dir})
+
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/test.txt", nil)
+	req.Header.Set("If-None-Match", `"different-etag"`)
+	h.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d (non-matching etag should return 200)", resp.Code, http.StatusOK)
+	}
+}
+
+func TestStatic_IfModifiedSince304(t *testing.T) {
+	logger.Init()
+
+	dir := t.TempDir()
+	if err := os.WriteFile(dir+"/test.txt", []byte("modified"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	stat, _ := os.Stat(dir + "/test.txt")
+	futureTime := stat.ModTime().Add(time.Hour).UTC().Format(http.TimeFormat)
+
+	h := New(config.Route{Path: "/", StaticDir: dir})
+
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/test.txt", nil)
+	req.Header.Set("If-Modified-Since", futureTime)
+	h.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusNotModified {
+		t.Errorf("status = %d, want %d (file not modified since future time)", resp.Code, http.StatusNotModified)
+	}
+}
+
+func TestStatic_IfModifiedSince200(t *testing.T) {
+	logger.Init()
+
+	dir := t.TempDir()
+	if err := os.WriteFile(dir+"/test.txt", []byte("old"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	stat, _ := os.Stat(dir + "/test.txt")
+	pastTime := stat.ModTime().Add(-time.Hour).UTC().Format(http.TimeFormat)
+
+	h := New(config.Route{Path: "/", StaticDir: dir})
+
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/test.txt", nil)
+	req.Header.Set("If-Modified-Since", pastTime)
+	h.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d (file modified after If-Modified-Since)", resp.Code, http.StatusOK)
+	}
+}
+
+func TestStatic_LastModifiedHeader(t *testing.T) {
+	logger.Init()
+
+	dir := t.TempDir()
+	if err := os.WriteFile(dir+"/test.txt", []byte("lastmod"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	h := New(config.Route{Path: "/", StaticDir: dir})
+
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/test.txt", nil)
+	h.ServeHTTP(resp, req)
+
+	lm := resp.Header().Get("Last-Modified")
+	if lm == "" {
+		t.Fatal("Last-Modified header not set")
+	}
+	if _, err := time.Parse(http.TimeFormat, lm); err != nil {
+		t.Errorf("Last-Modified %q is not a valid HTTP date: %v", lm, err)
+	}
+
+	resp.Header().Get("Accept-Ranges")
+}
+
+func TestStatic_AcceptRangesHeader(t *testing.T) {
+	logger.Init()
+
+	dir := t.TempDir()
+	if err := os.WriteFile(dir+"/test.txt", []byte("ranges"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	h := New(config.Route{Path: "/", StaticDir: dir})
+
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/test.txt", nil)
+	h.ServeHTTP(resp, req)
+
+	ar := resp.Header().Get("Accept-Ranges")
+	if ar != "bytes" {
+		t.Errorf("Accept-Ranges = %q, want %q", ar, "bytes")
+	}
+}
+
+func TestStatic_Range206(t *testing.T) {
+	logger.Init()
+
+	dir := t.TempDir()
+	content := []byte("0123456789abcdef")
+	if err := os.WriteFile(dir+"/test.txt", content, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	h := New(config.Route{Path: "/", StaticDir: dir})
+
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/test.txt", nil)
+	req.Header.Set("Range", "bytes=0-4")
+	h.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusPartialContent {
+		t.Errorf("status = %d, want %d", resp.Code, http.StatusPartialContent)
+	}
+
+	cr := resp.Header().Get("Content-Range")
+	if cr != "bytes 0-4/16" {
+		t.Errorf("Content-Range = %q, want %q", cr, "bytes 0-4/16")
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "01234" {
+		t.Errorf("body = %q, want %q", string(body), "01234")
+	}
+}
+
+func TestStatic_RangeMiddle(t *testing.T) {
+	logger.Init()
+
+	dir := t.TempDir()
+	content := []byte("0123456789abcdef")
+	if err := os.WriteFile(dir+"/test.txt", content, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	h := New(config.Route{Path: "/", StaticDir: dir})
+
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/test.txt", nil)
+	req.Header.Set("Range", "bytes=5-9")
+	h.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusPartialContent {
+		t.Errorf("status = %d, want %d", resp.Code, http.StatusPartialContent)
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "56789" {
+		t.Errorf("body = %q, want %q", string(body), "56789")
+	}
+}
+
+func TestStatic_RangeSuffix(t *testing.T) {
+	logger.Init()
+
+	dir := t.TempDir()
+	content := []byte("0123456789abcdef")
+	if err := os.WriteFile(dir+"/test.txt", content, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	h := New(config.Route{Path: "/", StaticDir: dir})
+
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/test.txt", nil)
+	req.Header.Set("Range", "bytes=-5")
+	h.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusPartialContent {
+		t.Errorf("status = %d, want %d", resp.Code, http.StatusPartialContent)
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "bcdef" {
+		t.Errorf("body = %q, want %q", string(body), "bcdef")
+	}
+}
+
+func TestStatic_RangeOpenEnded(t *testing.T) {
+	logger.Init()
+
+	dir := t.TempDir()
+	content := []byte("0123456789abcdef")
+	if err := os.WriteFile(dir+"/test.txt", content, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	h := New(config.Route{Path: "/", StaticDir: dir})
+
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/test.txt", nil)
+	req.Header.Set("Range", "bytes=10-")
+	h.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusPartialContent {
+		t.Errorf("status = %d, want %d", resp.Code, http.StatusPartialContent)
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "abcdef" {
+		t.Errorf("body = %q, want %q", string(body), "abcdef")
+	}
+}
+
+func TestStatic_Range416(t *testing.T) {
+	logger.Init()
+
+	dir := t.TempDir()
+	content := []byte("0123456789")
+	if err := os.WriteFile(dir+"/test.txt", content, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	h := New(config.Route{Path: "/", StaticDir: dir})
+
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/test.txt", nil)
+	req.Header.Set("Range", "bytes=100-200")
+	h.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusRequestedRangeNotSatisfiable {
+		t.Errorf("status = %d, want %d", resp.Code, http.StatusRequestedRangeNotSatisfiable)
+	}
+	cr := resp.Header().Get("Content-Range")
+	if cr != "bytes */10" {
+		t.Errorf("Content-Range = %q, want %q", cr, "bytes */10")
+	}
+}
+
+func TestStatic_RangeOnNormalGet(t *testing.T) {
+	logger.Init()
+
+	dir := t.TempDir()
+	content := []byte("full content")
+	if err := os.WriteFile(dir+"/test.txt", content, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	h := New(config.Route{Path: "/", StaticDir: dir})
+
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/test.txt", nil)
+	h.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d", resp.Code, http.StatusOK)
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "full content" {
+		t.Errorf("body = %q, want %q", string(body), "full content")
+	}
+}
+
+func TestStatic_SPA(t *testing.T) {
+	logger.Init()
+
+	dir := t.TempDir()
+	if err := os.WriteFile(dir+"/index.html", []byte("spa shell"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	h := New(config.Route{Path: "/", StaticDir: dir, SPA: true})
+
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/some/deep/path", nil)
+	h.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d (SPA should serve index.html)", resp.Code, http.StatusOK)
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "spa shell" {
+		t.Errorf("body = %q, want %q", string(body), "spa shell")
+	}
+}
+
+func TestStatic_SPANoIndex(t *testing.T) {
+	logger.Init()
+
+	dir := t.TempDir()
+	h := New(config.Route{Path: "/", StaticDir: dir, SPA: true})
+
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/some/path", nil)
+	h.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want %d (SPA without index.html should 404)", resp.Code, http.StatusNotFound)
+	}
+}
+
+func TestStatic_NoSPA(t *testing.T) {
+	logger.Init()
+
+	dir := t.TempDir()
+	h := New(config.Route{Path: "/", StaticDir: dir})
+
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/nonexistent", nil)
+	h.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want %d (no SPA should 404)", resp.Code, http.StatusNotFound)
+	}
+}
+
+func TestStatic_AutoIndex(t *testing.T) {
+	logger.Init()
+
+	dir := t.TempDir()
+	if err := os.WriteFile(dir+"/a.txt", []byte("a"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dir+"/b.txt", []byte("b"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	h := New(config.Route{Path: "/", StaticDir: dir, AutoIndex: true})
+
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/", nil)
+	h.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d", resp.Code, http.StatusOK)
+	}
+
+	ct := resp.Header().Get("Content-Type")
+	if ct != "text/html; charset=utf-8" {
+		t.Errorf("Content-Type = %q, want %q", ct, "text/html; charset=utf-8")
+	}
+
+	body := resp.Body.String()
+	if !strings.Contains(body, "a.txt") || !strings.Contains(body, "b.txt") {
+		t.Errorf("autoindex body should list files, got: %s", body)
+	}
+}
+
+func TestStatic_AutoIndexWithIndexHTML(t *testing.T) {
+	logger.Init()
+
+	dir := t.TempDir()
+	if err := os.WriteFile(dir+"/index.html", []byte("real index"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	h := New(config.Route{Path: "/", StaticDir: dir, AutoIndex: true})
+
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/", nil)
+	h.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d", resp.Code, http.StatusOK)
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "real index" {
+		t.Errorf("body = %q, want %q (index.html should take priority over autoindex)", string(body), "real index")
+	}
+}
+
+func TestStatic_AutoIndexHidesDotFiles(t *testing.T) {
+	logger.Init()
+
+	dir := t.TempDir()
+	if err := os.WriteFile(dir+"/visible.txt", []byte("v"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dir+"/.hidden", []byte("h"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	h := New(config.Route{Path: "/", StaticDir: dir, AutoIndex: true})
+
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/", nil)
+	h.ServeHTTP(resp, req)
+
+	body := resp.Body.String()
+	if !strings.Contains(body, "visible.txt") {
+		t.Errorf("autoindex should list visible files")
+	}
+	if strings.Contains(body, ".hidden") {
+		t.Errorf("autoindex should NOT list dotfiles")
+	}
+}
+
+func TestStatic_ErrorPages(t *testing.T) {
+	logger.Init()
+
+	dir := t.TempDir()
+	if err := os.WriteFile(dir+"/404.html", []byte("custom not found"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	h := New(config.Route{
+		Path:       "/",
+		StaticDir:  dir,
+		ErrorPages: map[int]string{404: "/404.html"},
+	})
+
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/nonexistent", nil)
+	h.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want %d", resp.Code, http.StatusNotFound)
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "custom not found" {
+		t.Errorf("body = %q, want %q", string(body), "custom not found")
+	}
+}
+
+func TestStatic_ErrorPagesWithoutFile(t *testing.T) {
+	logger.Init()
+
+	dir := t.TempDir()
+	h := New(config.Route{
+		Path:       "/",
+		StaticDir:  dir,
+		ErrorPages: map[int]string{404: "/nonexistent_error.html"},
+	})
+
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/missing", nil)
+	h.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want %d", resp.Code, http.StatusNotFound)
+	}
+}
+
+func TestStatic_ErrorPagesPathTraversal(t *testing.T) {
+	logger.Init()
+
+	dir := t.TempDir()
+	h := New(config.Route{
+		Path:       "/",
+		StaticDir:  dir,
+		ErrorPages: map[int]string{404: "/../../etc/passwd"},
+	})
+
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/missing", nil)
+	h.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want %d", resp.Code, http.StatusNotFound)
+	}
+}
+
+func TestStatic_SecurityHeaders(t *testing.T) {
+	logger.Init()
+
+	dir := t.TempDir()
+	if err := os.WriteFile(dir+"/test.txt", []byte("sec"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	h := New(config.Route{Path: "/", StaticDir: dir})
+
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/test.txt", nil)
+	h.ServeHTTP(resp, req)
+
+	if resp.Header().Get("X-Content-Type-Options") != "nosniff" {
+		t.Errorf("X-Content-Type-Options = %q, want %q", resp.Header().Get("X-Content-Type-Options"), "nosniff")
+	}
+	if resp.Header().Get("X-Frame-Options") != "DENY" {
+		t.Errorf("X-Frame-Options = %q, want %q", resp.Header().Get("X-Frame-Options"), "DENY")
+	}
+	if resp.Header().Get("Referrer-Policy") != "strict-origin-when-cross-origin" {
+		t.Errorf("Referrer-Policy = %q, want %q", resp.Header().Get("Referrer-Policy"), "strict-origin-when-cross-origin")
+	}
+}
+
+func TestStatic_NoSecurityHeaders(t *testing.T) {
+	logger.Init()
+
+	dir := t.TempDir()
+	if err := os.WriteFile(dir+"/test.txt", []byte("nosec"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	sec := false
+	h := New(config.Route{
+		Path: "/", StaticDir: dir,
+		SecurityHeaders: &sec,
+	})
+
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/test.txt", nil)
+	h.ServeHTTP(resp, req)
+
+	if resp.Header().Get("X-Content-Type-Options") == "nosniff" {
+		t.Errorf("X-Content-Type-Options should not be set when security_headers=false")
+	}
+}
+
+func TestStatic_SetHeaders(t *testing.T) {
+	logger.Init()
+
+	dir := t.TempDir()
+	if err := os.WriteFile(dir+"/test.txt", []byte("headers"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	h := New(config.Route{
+		Path: "/", StaticDir: dir,
+		SetHeaders: map[string]string{"X-Custom": "custom-value"},
+	})
+
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/test.txt", nil)
+	h.ServeHTTP(resp, req)
+
+	if resp.Header().Get("X-Custom") != "custom-value" {
+		t.Errorf("X-Custom = %q, want %q", resp.Header().Get("X-Custom"), "custom-value")
+	}
+}
+
+func TestStatic_GzipPrecompressed(t *testing.T) {
+	logger.Init()
+
+	dir := t.TempDir()
+	if err := os.WriteFile(dir+"/test.txt", []byte("original content"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dir+"/test.txt.gz", []byte("gzipped content"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	h := New(config.Route{Path: "/", StaticDir: dir})
+
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/test.txt", nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+	h.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d", resp.Code, http.StatusOK)
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "gzipped content" {
+		t.Errorf("body = %q, want %q (pre-compressed .gz should be served)", string(body), "gzipped content")
+	}
+}
+
+func TestStatic_GzipNotAccepted(t *testing.T) {
+	logger.Init()
+
+	dir := t.TempDir()
+	if err := os.WriteFile(dir+"/test.txt", []byte("original"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dir+"/test.txt.gz", []byte("gzipped"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	h := New(config.Route{Path: "/", StaticDir: dir})
+
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/test.txt", nil)
+	h.ServeHTTP(resp, req)
+
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "original" {
+		t.Errorf("body = %q, want %q (original file should be served without Accept-Encoding)", string(body), "original")
+	}
+}
+
+func TestStatic_ContentTypeSniffing(t *testing.T) {
+	logger.Init()
+
+	dir := t.TempDir()
+	if err := os.WriteFile(dir+"/unknown", []byte("<html>sniff</html>"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	h := New(config.Route{Path: "/", StaticDir: dir})
+
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/unknown", nil)
+	h.ServeHTTP(resp, req)
+
+	ct := resp.Header().Get("Content-Type")
+	if ct == "" {
+		t.Errorf("Content-Type should be detected by sniffing, got empty")
+	}
+}
+
+func TestStatic_ZeroLengthFile(t *testing.T) {
+	logger.Init()
+
+	dir := t.TempDir()
+	if err := os.WriteFile(dir+"/empty.txt", []byte{}, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	h := New(config.Route{Path: "/", StaticDir: dir})
+
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/empty.txt", nil)
+	h.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d", resp.Code, http.StatusOK)
+	}
+
+	cl := resp.Header().Get("Content-Length")
+	if cl != "0" {
+		t.Errorf("Content-Length = %q, want %q", cl, "0")
+	}
+}
+
+func TestStatic_ForeignDir(t *testing.T) {
+	logger.Init()
+
+	dir := t.TempDir()
+	otherDir := t.TempDir()
+	if err := os.WriteFile(otherDir+"/outside.txt", []byte("leak"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	h := New(config.Route{Path: "/", StaticDir: dir})
+
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/../"+filepath.Base(otherDir)+"/outside.txt", nil)
+	h.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusForbidden {
+		t.Errorf("status = %d, want %d (path traversal outside root)", resp.Code, http.StatusForbidden)
+	}
+}
+
+func TestStatic_SymlinkInsideRoot(t *testing.T) {
+	logger.Init()
+
+	dir := t.TempDir()
+	sub := filepath.Join(dir, "sub")
+	os.MkdirAll(sub, 0755)
+	if err := os.WriteFile(sub+"/actual.txt", []byte("via symlink"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	err := os.Symlink("sub/actual.txt", filepath.Join(dir, "link.txt"))
+	if err != nil {
+		t.Skip("symlink not supported on this platform")
+	}
+
+	h := New(config.Route{Path: "/", StaticDir: dir})
+
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/link.txt", nil)
+	h.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d", resp.Code, http.StatusOK)
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "via symlink" {
+		t.Errorf("body = %q, want %q", string(body), "via symlink")
+	}
+}
+
+func TestStatic_DeeplyNestedDirectory(t *testing.T) {
+	logger.Init()
+
+	dir := t.TempDir()
+	os.MkdirAll(dir+"/a/b/c/d/e", 0755)
+	if err := os.WriteFile(dir+"/a/b/c/d/e/deep.txt", []byte("deep"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	h := New(config.Route{Path: "/", StaticDir: dir})
+
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/a/b/c/d/e/deep.txt", nil)
+	h.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d", resp.Code, http.StatusOK)
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "deep" {
+		t.Errorf("body = %q, want %q", string(body), "deep")
+	}
+}
+
+func TestStatic_ConcurrentRequests(t *testing.T) {
+	logger.Init()
+
+	dir := t.TempDir()
+	if err := os.WriteFile(dir+"/concurrent.txt", []byte("concurrent"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	h := New(config.Route{Path: "/", StaticDir: dir})
+
+	errCh := make(chan error, 20)
+	for range 20 {
+		go func() {
+			resp := httptest.NewRecorder()
+			req := httptest.NewRequest("GET", "/concurrent.txt", nil)
+			h.ServeHTTP(resp, req)
+			if resp.Code != http.StatusOK {
+				errCh <- fmt.Errorf("concurrent request status = %d", resp.Code)
+				return
+			}
+			errCh <- nil
+		}()
+	}
+
+	for range 20 {
+		if err := <-errCh; err != nil {
+			t.Error(err)
+		}
 	}
 }

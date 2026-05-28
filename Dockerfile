@@ -8,7 +8,6 @@ RUN apk add --no-cache ca-certificates
 WORKDIR /src
 
 COPY go.mod ./
-
 COPY . .
 
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
@@ -19,17 +18,16 @@ FROM scratch
 
 COPY --from=builder /usr/local/bin/gofly /gofly
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
-COPY config.json /etc/gofly/config.json
 
 EXPOSE 80 443
 
 USER 65534:65534
 
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-  CMD ["/gofly", "-config", "/etc/gofly/config.json", "-health"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
+  CMD ["/gofly", "-health", "-port", "80"]
 
 ENTRYPOINT ["/gofly"]
-CMD ["-config", "/etc/gofly/config.json"]
+CMD ["-root", "/www"]
 
 LABEL org.opencontainers.image.source="https://github.com/rroblf01/gofly"
 LABEL org.opencontainers.image.description="Minimal HTTP reverse proxy and static file server"

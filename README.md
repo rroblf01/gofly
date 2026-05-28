@@ -17,28 +17,63 @@ A fast, lightweight HTTP reverse proxy and static file server written in Go. Des
 - **Gzip compression** — per-route configurable via `gzip`
 - **TLS/HTTPS** — manual certificate support
 - **Graceful shutdown** — on SIGINT/SIGTERM with 30s timeout
-- **JSON structured logging** — via `log/slog`
+- **JSON structured logging** — via `log/slog`, async with channel buffer (non-blocking)
+- **SO_REUSEPORT** — multiple accept goroutines on Linux, configurable via `workers`
+- **sendfile(2)** — kernel zero-copy static file serving (via `io.ReaderFrom`)
+- **Pre-compressed static files** — serve `.gz` files when client accepts gzip (gzip_static)
+- **Pooled buffers** — `sync.Pool` for sniff buffer and response writers
 - **Pure stdlib** — zero external dependencies
 - **Multi-architecture** builds (amd64, arm64)
 - **Scratch-based Docker image** (~7 MB)
 
 ## Quick start
 
-### Using Docker
+### Using pre-built images (ghcr.io)
+
+Pull the latest image from GitHub Container Registry:
 
 ```bash
-# Build
+docker pull ghcr.io/rroblf01/gofly:latest
+```
+
+Serve a static site with zero configuration:
+
+```bash
+docker run -d --name gofly \
+  -p 80:80 \
+  -v /path/to/your/site:/www:ro \
+  ghcr.io/rroblf01/gofly:latest
+```
+
+With a custom config file:
+
+```bash
+docker run -d --name gofly \
+  -p 80:80 \
+  -p 443:443 \
+  -v /path/to/config.json:/etc/gofly/config.json:ro \
+  -v /path/to/your/site:/www:ro \
+  ghcr.io/rroblf01/gofly:latest
+```
+
+With environment variable expansion in config:
+
+```bash
+docker run -d --name gofly \
+  -p 80:80 \
+  -e SITE_ROOT=/www \
+  -v /path/to/config.json:/etc/gofly/config.json:ro \
+  -v /path/to/your/site:/www:ro \
+  ghcr.io/rroblf01/gofly:latest
+```
+
+### Building locally
+
+```bash
 make docker
 
 # Run
-docker run -d --name gofly -p 80:80 gofly:latest
-
-# With custom config and static files
-docker run -d --name gofly \
-  -p 80:80 \
-  -v /path/to/config.json:/etc/gofly/config.json:ro \
-  -v /var/www/html:/var/www/html:ro \
-  gofly:latest
+docker run -d --name gofly -p 80:80 -v ./www:/www:ro gofly:latest
 ```
 
 ### Building from source
@@ -88,6 +123,8 @@ gofly uses a single JSON config file. Default path: `/etc/gofly/config.json` (ov
 ```json
 {
   "port": 80,
+  "workers": 1,
+  "access_log": true,
   "read_timeout": "30s",
   "write_timeout": "30s",
   "idle_timeout": "120s",
@@ -134,8 +171,10 @@ gofly uses a single JSON config file. Default path: `/etc/gofly/config.json` (ov
 #### Global config
 
 | Field | Type | Default | Description |
-|---|---|---|---|
+|---|---|---|---|---|
 | `port` | int | `80` | HTTP listen port |
+| `workers` | int | `1` | Number of SO_REUSEPORT accept goroutines (Linux only) |
+| `access_log` | bool | `true` | Enable/disable access log (disable for maximum throughput) |
 | `read_timeout` | string | `"30s"` | Max duration for reading request |
 | `write_timeout` | string | `"30s"` | Max duration for writing response |
 | `idle_timeout` | string | `"120s"` | Max duration for idle connections |
@@ -190,6 +229,17 @@ Returns `{"status":"ok"}` with HTTP 200.
 
 ## Docker
 
+### Image registry
+
+Pre-built images are published to **GitHub Container Registry** on every release:
+
+```
+ghcr.io/rroblf01/gofly:latest
+ghcr.io/rroblf01/gofly:<version>    (e.g. v0.1.0)
+ghcr.io/rroblf01/gofly:<major>     (e.g. 0)
+ghcr.io/rroblf01/gofly:<major>.<minor> (e.g. 0.1)
+```
+
 ### Build the image
 
 ```bash
@@ -207,6 +257,65 @@ Supports multi-arch builds:
 docker buildx build --platform linux/amd64,linux/arm64 -t gofly:latest .
 ```
 
+### Usage examples
+
+**Configless mode** — serve a static site, no config file needed:
+
+```bash
+docker run -d --name gofly \
+  -p 80:80 \
+  -v /path/to/site:/www:ro \
+  ghcr.io/rroblf01/gofly:latest
+```
+
+**With config file** — proxy, TLS, rate limiting, etc.:
+
+```bash
+docker run -d --name gofly \
+  -p 80:80 \
+  -p 443:443 \
+  -v /path/to/config.json:/etc/gofly/config.json:ro \
+  -v /path/to/site:/www:ro \
+  ghcr.io/rroblf01/gofly:latest
+```
+
+**Configless + custom port**:
+
+```bash
+docker run -d --name gofly \
+  -p 8080:8080 \
+  -v /path/to/site:/www:ro \
+  ghcr.io/rroblf01/gofly:latest -root /www -port 8080
+```
+
+**Production — GOGC=off with built-in memory limit** (100 MB default):
+
+```bash
+docker run -d --name gofly \
+  -p 80:80 \
+  -v /path/to/site:/www:ro \
+  -e GOGC=off \
+  ghcr.io/rroblf01/gofly:latest
+```
+
+### Memory management
+
+gofly sets a **soft memory limit** of **100 MB** by default (via `debug.SetMemoryLimit`). The Go runtime triggers GC when the heap approaches this limit, keeping RSS bounded even under high load.
+
+Override in config:
+
+```json
+{
+  "memory_limit": 268435456
+}
+```
+
+Or via environment variable (takes precedence over the config default):
+
+```bash
+docker run -e GOMEMLIMIT=200MiB -e GOGC=off ...
+```
+
 ### Docker Compose
 
 ```bash
@@ -219,64 +328,106 @@ docker compose --profile example up -d
 
 ## Performance
 
-### Benchmark results (AMD Ryzen 5 3600, Go 1.26)
+### Load test (wrk — 100 concurrent connections, 4 threads, 15s)
 
-#### Load test (wrk — 100 concurrent connections, 4 threads, 15s)
+Same static page (`www/index.html`, ~800 B), same hardware (AMD Ryzen 5 3600, 12 cores).
 
-```
-Running 15s test @ http://127.0.0.1:9999/ (index.html served)
-  Latency:   1.23ms avg  (max 63.99ms, 91.35% < 1.23ms)
-  Req/Sec:   25.59k avg  (max 31.58k)
-  1,530,668 requests in 15.06s
-Requests/sec: 101,647
-Transfer/sec:  88.70 MB
-```
+| Config | Requests/s | Latency (avg) | Memory (RSS) |
+|---|---|---|---|
+| gofly (1 worker, access_log off) | 108,566 | 1.12 ms | ~21 MB |
+| gofly (SO_REUSEPORT ×12, access_log off) | 114,185 | 1.07 ms | ~21 MB |
+| gofly (SO_REUSEPORT ×12, access_log off, GOGC=off, GOMEMLIMIT=200MiB) | **127,051** | **0.88 ms** | **~190 MB** |
+| **nginx alpine** (`worker_processes auto`, access_log off) | **136,930** | **0.85 ms** | **~10 MB** |
 
-#### Memory usage
-
-| State | Resident (RSS) |
-|---|---|
-| Idle (server loaded, no traffic) | ~7 MB |
-| After 1000 requests | ~12 MB |
-| After sustained load | ~12 MB |
+gofly reaches **93% of nginx throughput** with **zero external dependencies**, a **5× smaller Docker image**, and **memory-safe Go**.
 
 ### Comparison with nginx
 
-Run against the same static page (`www/index.html`, ~600 B), same hardware (Ryzen 5 3600), same load tester (`wrk -t4 -c100 -d15s`), serving from `/` (serves `index.html`). Both with access logging disabled (`access_log: false` in config, `access_log off;` in nginx).
-
 | Metric | gofly (scratch) | nginx (alpine) | Difference |
 |---|---|---|---|
-| **Requests/sec** | **101,647** | 92,191 | **+10% faster** 🏆 |
-| **Latency (avg)** | **1.23 ms** | 1.29 ms | **-5%** 🏆 |
-| **Latency (max)** | **64 ms** | 87 ms | **-26%** 🏆 |
-| **Memory (RSS)** | ~21 MB | ~11 MB | +10 MB |
+| **Requests/sec** | 127,051 | 136,930 | -7% |
+| **Latency (avg)** | 0.88 ms | 0.85 ms | +3% |
 | **Image size** | **~7 MB** | ~35 MB | **5× smaller** 🏆 |
 | **Dependencies** | **0** (pure stdlib) | libc, PCRE, zlib, OpenSSL | **—** 🏆 |
 | **Static binary** | ✅ Yes | ❌ No | **—** 🏆 |
+| **Memory safety** | ✅ Yes (Go) | ❌ No (C) | **—** 🏆 |
+| **Configuration** | **JSON (simple)** | nginx.conf | **—** 🏆 |
 
-> gofly beats nginx by **+10% throughput** with **5× smaller Docker image** and **zero external dependencies**.
+> gofly delivers **93% of nginx throughput** while being **5× smaller**, **zero dependencies**, and **memory-safe by construction**.
 
-#### Go benchmarks (internal, per-core)
+### Memory usage
+
+| State | gofly (default GC) | gofly (GOGC=off, GOMEMLIMIT=200MiB) |
+|---|---|---|
+| Idle (no traffic) | ~10 MB | ~10 MB |
+| After sustained load | ~21 MB | ~190 MB |
+
+> `GOMEMLIMIT` caps Go's heap and triggers GC only when needed. Without it, `GOGC=off` lets the heap grow unbounded.
+
+### Architecture and optimizations
+
+gofly achieves its performance through:
+
+- **sendfile(2) zero-copy** — `w.(io.ReaderFrom).ReadFrom(f)` delegates directly to Go's `net.TCPConn.ReadFrom`, which uses `sendfile(2)` on Linux when the source is a regular file. No userspace buffer copy.
+- **SO_REUSEPORT** — multiple goroutines accept on separate sockets, kernel distributes connections across them. Configurable via `workers`.
+- **Async logging** — log entries go to a buffered channel (16384 capacity), background goroutine drains it. `access_log: false` bypasses the wrapper entirely (zero cost).
+- **Pooled response writer** — `sync.Pool` reuses `responseWriter` structs across requests.
+- **Sniff buffer pool** — 512-byte `sync.Pool` for `http.DetectContentType` fallback.
+- **Direct header map** — `h["Content-Type"] = []string{ctype}` avoids `Header().Set()` overhead.
+- **Pre-compiled Cache-Control** — string concatenation at init time, no `fmt.Sprintf` on hot path.
+- **Pre-built ReverseProxy** — created once in `New()`, not per-request.
+- **Atomic round-robin** — `atomic.Uint64`, no locks.
+- **Tuned TCP** — `TCP_DEFER_ACCEPT` + `TCP_QUICKACK` on listener socket (Linux).
+- **GC control** — pair `GOGC=off` with `GOMEMLIMIT` for near-zero GC overhead with bounded memory.
+
+### Production tuning
+
+gofly sets a **soft memory limit of 100 MB** by default. Override via `"memory_limit"` in config (bytes) or `GOMEMLIMIT` env var.
+
+For maximum throughput:
+
+```bash
+GOGC=off gofly -config config.json
+```
+
+- `GOGC=off` — disables GC triggering based on heap growth (memory stays bounded by `debug.SetMemoryLimit`).
+- Set `"workers": N` (matching CPU count) for SO_REUSEPORT accept distribution.
+- Set `"access_log": false` to bypass the logging wrapper entirely.
+
+## GitHub Actions
+
+On every release (`v*.*.*`), a workflow publishes multi-arch Docker images to `ghcr.io/rroblf01/gofly`:
+
+| Tag | Example |
+|---|---|
+| `latest` | `ghcr.io/rroblf01/gofly:latest` |
+| semver full | `ghcr.io/rroblf01/gofly:v0.1.0` |
+| semver minor | `ghcr.io/rroblf01/gofly:0.1` |
+| semver major | `ghcr.io/rroblf01/gofly:0` |
+
+Multi-arch: `linux/amd64`, `linux/arm64`.
+
+To trigger a release:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+# Create the release on GitHub → workflow publishes the image
+```
+
+### Go benchmarks (internal, per-core)
 
 | Benchmark | Ops | Latency | Allocs/op | Bytes/op |
 |---|---|---|---|---|
 | Reverse proxy (single upstream) | 14,431 | 81.4 µs | 167 | 54,839 |
 | Reverse proxy (3 upstreams, round-robin) | 14,899 | 85.2 µs | 166 | 54,703 |
-| Static file (small, 13 B) | 36,088 | 33.6 µs | 109 | 14,596 |
+| Static file (small, 13 B) | 64,845 | 18.3 µs | 119 | 11,458 |
 | Static file (large, 256 KB) | 20,676 | 52.5 µs | 110 | 17,051 |
 | Proxy throughput (sequential) | 7,226 | 138.5 µs | 150 | 46,108 |
 | Real-world page (HTML+CSS+JS) | 7,430 | 156.5 µs | 166 | 15,398 |
 | **Heap alloc per request** | **7,467** | **143.1 µs** | **13.71 B/req** | **46,174** |
 
 > Note: Parallel benchmarks use `RunParallel` and auto-scale to GOMAXPROCS (12 cores).
-
-### Key design decisions
-
-- **Connection pooling**: `http.Transport` shared across all proxies (100 max idle, 10 per host)
-- **Pre-built ReverseProxy**: created once in `New()`, not per-request (zero allocation on hot path)
-- **Atomic round-robin**: `atomic.Uint64` — no locks on the hot path
-- **Nil-safe logger**: no panic even if logger is not initialized
-- **Full GC control**: tune with `GOGC` and `GOMEMLIMIT` env vars
 
 ## Architecture
 
