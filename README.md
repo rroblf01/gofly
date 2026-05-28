@@ -221,15 +221,15 @@ docker compose --profile example up -d
 
 ### Benchmark results (AMD Ryzen 5 3600, Go 1.26)
 
-#### Load test (wrk — 100 concurrent connections, 4 threads)
+#### Load test (wrk — 100 concurrent connections, 4 threads, 10s)
 
 ```
-Running 10s test @ http://127.0.0.1:9999/index.html
-  Latency:   1.25ms avg  (max 41.31ms, 87.78% < 1.25ms)
-  Req/Sec:   25.78k avg  (max 28.04k)
-  1,026,341 requests in 10.02s
-Requests/sec: 102,438
-Transfer/sec:  10.16 MB
+Running 10s test @ http://127.0.0.1:9999/ (index.html served)
+  Latency:   1.56ms avg  (max 44.24ms, 89.31% < 1.56ms)
+  Req/Sec:   20.08k avg  (max 25.45k)
+  800,167 requests in 10.03s
+Requests/sec: 79,802
+Transfer/sec:  74.81 MB
 ```
 
 #### Memory usage
@@ -240,7 +240,23 @@ Transfer/sec:  10.16 MB
 | After 1000 requests | ~12 MB |
 | After sustained load | ~12 MB |
 
-#### Go benchmarks
+### Comparison with nginx
+
+Run against the same static page (`www/index.html`, ~600 B), same hardware (Ryzen 5 3600), same load tester (`wrk -t4 -c100 -d10s`), serving from the root path `/` (which serves `index.html`).
+
+| Metric | gofly (scratch) | nginx (alpine) | Difference |
+|---|---|---|---|
+| **Requests/sec** | 79,802 | 89,771 | gofly at **89%** of nginx |
+| **Latency (avg)** | 1.56 ms | 1.41 ms | +0.15 ms |
+| **Latency (max)** | 44 ms | 95 ms | 2× lower max |
+| **Memory (RSS)** | ~19 MB | ~11 MB | +8 MB |
+| **Image size** | ~7 MB | ~35 MB | **5× smaller** |
+| **Dependencies** | **0** (pure stdlib) | libc, PCRE, zlib, OpenSSL | — |
+| **Static binary** | ✅ Yes | ❌ No | — |
+
+> gofly serves **79,802 req/sec** at **1.56 ms** latency — within striking distance of nginx (89% throughput) while using **zero external dependencies** and producing a **5× smaller Docker image**.
+
+#### Go benchmarks (internal, per-core)
 
 | Benchmark | Ops | Latency | Allocs/op | Bytes/op |
 |---|---|---|---|---|
