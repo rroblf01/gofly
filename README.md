@@ -221,15 +221,15 @@ docker compose --profile example up -d
 
 ### Benchmark results (AMD Ryzen 5 3600, Go 1.26)
 
-#### Load test (wrk — 100 concurrent connections, 4 threads, 10s)
+#### Load test (wrk — 100 concurrent connections, 4 threads, 15s)
 
 ```
-Running 10s test @ http://127.0.0.1:9999/ (index.html served)
-  Latency:   1.56ms avg  (max 44.24ms, 89.31% < 1.56ms)
-  Req/Sec:   20.08k avg  (max 25.45k)
-  800,167 requests in 10.03s
-Requests/sec: 79,802
-Transfer/sec:  74.81 MB
+Running 15s test @ http://127.0.0.1:9999/ (index.html served)
+  Latency:   1.23ms avg  (max 63.99ms, 91.35% < 1.23ms)
+  Req/Sec:   25.59k avg  (max 31.58k)
+  1,530,668 requests in 15.06s
+Requests/sec: 101,647
+Transfer/sec:  88.70 MB
 ```
 
 #### Memory usage
@@ -242,19 +242,19 @@ Transfer/sec:  74.81 MB
 
 ### Comparison with nginx
 
-Run against the same static page (`www/index.html`, ~600 B), same hardware (Ryzen 5 3600), same load tester (`wrk -t4 -c100 -d10s`), serving from the root path `/` (which serves `index.html`).
+Run against the same static page (`www/index.html`, ~600 B), same hardware (Ryzen 5 3600), same load tester (`wrk -t4 -c100 -d15s`), serving from `/` (serves `index.html`). Both with access logging disabled (`access_log: false` in config, `access_log off;` in nginx).
 
 | Metric | gofly (scratch) | nginx (alpine) | Difference |
 |---|---|---|---|
-| **Requests/sec** | 79,802 | 89,771 | gofly at **89%** of nginx |
-| **Latency (avg)** | 1.56 ms | 1.41 ms | +0.15 ms |
-| **Latency (max)** | 44 ms | 95 ms | 2× lower max |
-| **Memory (RSS)** | ~19 MB | ~11 MB | +8 MB |
-| **Image size** | ~7 MB | ~35 MB | **5× smaller** |
-| **Dependencies** | **0** (pure stdlib) | libc, PCRE, zlib, OpenSSL | — |
-| **Static binary** | ✅ Yes | ❌ No | — |
+| **Requests/sec** | **101,647** | 92,191 | **+10% faster** 🏆 |
+| **Latency (avg)** | **1.23 ms** | 1.29 ms | **-5%** 🏆 |
+| **Latency (max)** | **64 ms** | 87 ms | **-26%** 🏆 |
+| **Memory (RSS)** | ~21 MB | ~11 MB | +10 MB |
+| **Image size** | **~7 MB** | ~35 MB | **5× smaller** 🏆 |
+| **Dependencies** | **0** (pure stdlib) | libc, PCRE, zlib, OpenSSL | **—** 🏆 |
+| **Static binary** | ✅ Yes | ❌ No | **—** 🏆 |
 
-> gofly serves **79,802 req/sec** at **1.56 ms** latency — within striking distance of nginx (89% throughput) while using **zero external dependencies** and producing a **5× smaller Docker image**.
+> gofly beats nginx by **+10% throughput** with **5× smaller Docker image** and **zero external dependencies**.
 
 #### Go benchmarks (internal, per-core)
 

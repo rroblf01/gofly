@@ -16,6 +16,7 @@ type Config struct {
 	MaxBodySize  int64      `json:"max_body_size,omitempty"`
 	RateLimit    *RateLimit `json:"rate_limit,omitempty"`
 	TLS          *TLSConfig `json:"tls,omitempty"`
+	AccessLog    *bool      `json:"access_log,omitempty"`
 	Routes       []Route    `json:"routes"`
 }
 
@@ -136,6 +137,10 @@ func (c *Config) validate() error {
 		}
 	}
 	return nil
+}
+
+func (c *Config) AccessLogEnabled() bool {
+	return c.AccessLog == nil || *c.AccessLog
 }
 
 func (r *Route) EffectiveMaxBodySize(defaultSize int64) int64 {

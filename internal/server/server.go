@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/signal"
@@ -19,12 +20,24 @@ import (
 	"github.com/rroblf01/gofly/internal/static"
 )
 
+type logEntry struct {
+	start    time.Time
+	method   string
+	path     string
+	status   int
+	duration time.Duration
+	upstream string
+}
+
 type Server struct {
 	cfg        config.Config
 	http       *http.Server
 	mux        *http.ServeMux
 	rateLimits map[string]*tokenBucket
 	rlMu       sync.RWMutex
+	logCh      chan logEntry
+	logWg      sync.WaitGroup
+	stopLog    chan struct{}
 }
 
 type tokenBucket struct {
@@ -67,9 +80,12 @@ func New(cfg config.Config) *Server {
 		cfg:        cfg,
 		mux:        mux,
 		rateLimits: make(map[string]*tokenBucket),
+		logCh:      make(chan logEntry, 16384),
+		stopLog:    make(chan struct{}),
 	}
 
 	s.registerRoutes()
+	s.startLogWorker()
 
 	handler := s.middleware(mux)
 	if cfg.RateLimit != nil {
@@ -193,11 +209,34 @@ func (s *Server) rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+func (s *Server) startLogWorker() {
+	s.logWg.Add(1)
+	go func() {
+		defer s.logWg.Done()
+		for {
+			select {
+			case entry := <-s.logCh:
+				logger.LogAccess(entry.start, entry.method, entry.path, entry.status, entry.duration, entry.upstream)
+			case <-s.stopLog:
+				for len(s.logCh) > 0 {
+					entry := <-s.logCh
+					logger.LogAccess(entry.start, entry.method, entry.path, entry.status, entry.duration, entry.upstream)
+				}
+				return
+			}
+		}
+	}()
+}
+
 func (s *Server) middleware(next http.Handler) http.Handler {
+	if !s.cfg.AccessLogEnabled() {
+		return next
+	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 
 		lrw := newResponseWriter(w)
+		defer putResponseWriter(lrw)
 
 		if id := r.Header.Get("X-Request-ID"); id != "" {
 			r = r.WithContext(logger.WithRequestID(r.Context(), id))
@@ -205,8 +244,10 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 
 		next.ServeHTTP(lrw, r)
 
-		dur := time.Since(start)
-		logger.LogAccess(start, r.Method, r.URL.Path, lrw.status, dur, lrw.upstream)
+		select {
+		case s.logCh <- logEntry{start, r.Method, r.URL.Path, lrw.status, time.Since(start), lrw.upstream}:
+		default:
+		}
 	})
 }
 
@@ -218,7 +259,10 @@ func (s *Server) ListenAndServe() error {
 }
 
 func (s *Server) Shutdown(ctx context.Context) error {
-	return s.http.Shutdown(ctx)
+	err := s.http.Shutdown(ctx)
+	close(s.stopLog)
+	s.logWg.Wait()
+	return err
 }
 
 func Run(cfg config.Config) error {
@@ -258,8 +302,24 @@ type responseWriter struct {
 	written  bool
 }
 
+var rwPool = sync.Pool{
+	New: func() any {
+		return &responseWriter{}
+	},
+}
+
 func newResponseWriter(w http.ResponseWriter) *responseWriter {
-	return &responseWriter{ResponseWriter: w, status: http.StatusOK}
+	rw := rwPool.Get().(*responseWriter)
+	rw.ResponseWriter = w
+	rw.status = http.StatusOK
+	rw.upstream = ""
+	rw.written = false
+	return rw
+}
+
+func putResponseWriter(rw *responseWriter) {
+	rw.ResponseWriter = nil
+	rwPool.Put(rw)
 }
 
 func (rw *responseWriter) SetUpstream(u string) {
@@ -279,6 +339,16 @@ func (rw *responseWriter) Write(b []byte) (int, error) {
 		rw.WriteHeader(http.StatusOK)
 	}
 	return rw.ResponseWriter.Write(b)
+}
+
+func (rw *responseWriter) ReadFrom(r io.Reader) (int64, error) {
+	if !rw.written {
+		rw.WriteHeader(http.StatusOK)
+	}
+	if rf, ok := rw.ResponseWriter.(io.ReaderFrom); ok {
+		return rf.ReadFrom(r)
+	}
+	return io.Copy(rw.ResponseWriter, r)
 }
 
 func extractIP(r *http.Request) string {
