@@ -47,21 +47,15 @@ type Server struct {
 }
 
 type swappableHandler struct {
-	mu      sync.RWMutex
 	handler atomic.Value
 }
 
 func (sh *swappableHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	sh.mu.RLock()
-	h := sh.handler.Load().(http.Handler)
-	sh.mu.RUnlock()
-	h.ServeHTTP(w, r)
+	sh.handler.Load().(http.Handler).ServeHTTP(w, r)
 }
 
 func (sh *swappableHandler) Swap(h http.Handler) {
-	sh.mu.Lock()
 	sh.handler.Store(h)
-	sh.mu.Unlock()
 }
 
 type tokenBucket struct {
@@ -238,12 +232,15 @@ func (s *Server) rateLimitMiddleware(next http.Handler) http.Handler {
 		s.rlMu.RUnlock()
 
 		if !exists {
-			bucket = newTokenBucket(
-				s.cfg.RateLimit.RequestsPerSecond,
-				s.cfg.RateLimit.Burst,
-			)
 			s.rlMu.Lock()
-			s.rateLimits[ip] = bucket
+			bucket, exists = s.rateLimits[ip]
+			if !exists {
+				bucket = newTokenBucket(
+					s.cfg.RateLimit.RequestsPerSecond,
+					s.cfg.RateLimit.Burst,
+				)
+				s.rateLimits[ip] = bucket
+			}
 			s.rlMu.Unlock()
 		}
 

@@ -180,7 +180,7 @@ func (h *Handler) serveFile(w http.ResponseWriter, r *http.Request, f *os.File, 
 		sniffPool.Put(bufp)
 	}
 
-	if r.Header.Get("Range") != "" && strings.HasPrefix(r.Header.Get("Range"), "bytes=") {
+	if rangeHdr := r.Header.Get("Range"); rangeHdr != "" && strings.HasPrefix(rangeHdr, "bytes=") {
 		if h.serveRange(w, r, f, stat, ctype, etag, lastMod) {
 			return
 		}
@@ -226,7 +226,10 @@ func (h *Handler) serveRange(w http.ResponseWriter, r *http.Request, f *os.File,
 	}
 
 	ra := ranges[0]
-	if ra.start >= stat.Size() || ra.end >= stat.Size() || ra.start > ra.end {
+	if ra.end >= stat.Size() {
+		ra.end = stat.Size() - 1
+	}
+	if ra.start >= stat.Size() || ra.start > ra.end {
 		hdr := w.Header()
 		hdr["Content-Range"] = []string{fmt.Sprintf("bytes */%d", stat.Size())}
 		w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)

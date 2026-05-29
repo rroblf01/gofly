@@ -545,6 +545,32 @@ func TestStatic_RangeOpenEnded(t *testing.T) {
 	}
 }
 
+func TestStatic_RangeEndClamping(t *testing.T) {
+	logger.Init()
+
+	dir := t.TempDir()
+	content := []byte("0123456789")
+	if err := os.WriteFile(dir+"/test.txt", content, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	h := New(config.Route{Path: "/", StaticDir: dir})
+
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/test.txt", nil)
+	req.Header.Set("Range", "bytes=0-999")
+	h.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusPartialContent {
+		t.Errorf("status = %d, want %d (clamped range should be 206)", resp.Code, http.StatusPartialContent)
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "0123456789" {
+		t.Errorf("body = %q, want %q (should serve entire file when end is clamped)", string(body), "0123456789")
+	}
+}
+
 func TestStatic_Range416(t *testing.T) {
 	logger.Init()
 

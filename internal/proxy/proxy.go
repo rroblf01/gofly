@@ -32,6 +32,7 @@ var DefaultTransport = &http.Transport{
 
 type UpstreamState struct {
 	url       *url.URL
+	index     int
 	failCount int32
 	lastFail  int64
 	disabled  int32
@@ -47,13 +48,13 @@ type Proxy struct {
 func New(route config.Route) (*Proxy, error) {
 	p := &Proxy{route: route}
 
-	for _, u := range route.Upstreams {
+	for i, u := range route.Upstreams {
 		parsed, err := url.Parse(u)
 		if err != nil {
 			return nil, err
 		}
 
-		state := &UpstreamState{url: parsed}
+		state := &UpstreamState{url: parsed, index: i}
 		p.upstreams = append(p.upstreams, state)
 
 		rp := httputil.NewSingleHostReverseProxy(parsed)
@@ -122,8 +123,26 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
 	}
 
-	idx := upstreamIndex(p.upstreams, up)
-	p.reverseproxies[idx].ServeHTTP(w, r)
+	p.reverseproxies[up.index].ServeHTTP(w, r)
+}
+
+func (p *Proxy) applyDirector(req *http.Request) {
+	req.Header.Set("X-Forwarded-For", req.RemoteAddr)
+	req.Header.Set("X-Forwarded-Host", req.Host)
+	req.Header.Set("X-Forwarded-Proto", scheme(req))
+
+	for k, v := range p.route.SetHeaders {
+		req.Header.Set(k, expandVars(v, req))
+	}
+	for _, h := range p.route.RemoveHeaders {
+		req.Header.Del(h)
+	}
+	if p.route.Host != "" {
+		req.Host = expandVars(p.route.Host, req)
+	}
+	if p.route.Rewrite != "" {
+		req.URL.Path = expandVars(p.route.Rewrite, req)
+	}
 }
 
 func (p *Proxy) director(up *url.URL, base func(*http.Request)) func(*http.Request) {
@@ -131,22 +150,7 @@ func (p *Proxy) director(up *url.URL, base func(*http.Request)) func(*http.Reque
 		if base != nil {
 			base(req)
 		}
-		req.Header.Set("X-Forwarded-For", req.RemoteAddr)
-		req.Header.Set("X-Forwarded-Host", req.Host)
-		req.Header.Set("X-Forwarded-Proto", scheme(req))
-
-		for k, v := range p.route.SetHeaders {
-			req.Header.Set(k, expandVars(v, req))
-		}
-		for _, h := range p.route.RemoveHeaders {
-			req.Header.Del(h)
-		}
-		if p.route.Host != "" {
-			req.Host = expandVars(p.route.Host, req)
-		}
-		if p.route.Rewrite != "" {
-			req.URL.Path = expandVars(p.route.Rewrite, req)
-		}
+		p.applyDirector(req)
 	}
 }
 
@@ -167,8 +171,7 @@ func (p *Proxy) errorHandler(state *UpstreamState) func(http.ResponseWriter, *ht
 					"upstream": up.url.String(),
 					"path":     r.URL.Path,
 				})
-				idx := upstreamIndex(p.upstreams, up)
-				p.reverseproxies[idx].ServeHTTP(w, r)
+				p.reverseproxies[up.index].ServeHTTP(w, r)
 				return
 			}
 		}
@@ -230,16 +233,7 @@ func isWebSocket(r *http.Request) bool {
 }
 
 func (p *Proxy) serveWebSocket(w http.ResponseWriter, r *http.Request, target *url.URL) {
-	targetScheme := target.Scheme
-	if targetScheme == "" {
-		targetScheme = "ws"
-	}
-	if targetScheme == "https" {
-		targetScheme = "wss"
-	} else if targetScheme == "http" {
-		targetScheme = "ws"
-	}
-	_ = targetScheme
+	p.applyDirector(r)
 
 	targetAddr := target.Host
 	if !strings.Contains(targetAddr, ":") {
@@ -310,11 +304,4 @@ func scheme(r *http.Request) string {
 	return "http"
 }
 
-func upstreamIndex(upstreams []*UpstreamState, target *UpstreamState) int {
-	for i, u := range upstreams {
-		if u == target {
-			return i
-		}
-	}
-	return 0
-}
+
