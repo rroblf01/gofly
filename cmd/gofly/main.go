@@ -9,8 +9,13 @@ import (
 
 	"github.com/rroblf01/gofly/internal/config"
 	"github.com/rroblf01/gofly/internal/logger"
+	"github.com/rroblf01/gofly/internal/metrics"
 	"github.com/rroblf01/gofly/internal/server"
 )
+
+// version is set at build time via -ldflags "-X main.version=...". It defaults
+// to "dev" for plain `go build`/`go run`.
+var version = "dev"
 
 func main() {
 	configPath := flag.String("config", "", "path to config file")
@@ -19,10 +24,11 @@ func main() {
 	showVersion := flag.Bool("version", false, "show version")
 	root := flag.String("root", "", "serve static files from this directory (configless mode)")
 	healthCheck := flag.Bool("health", false, "perform health check against running server")
+	testConfig := flag.Bool("t", false, "test configuration: load and validate, then exit")
 	flag.Parse()
 
 	if *showVersion {
-		fmt.Println("gofly v0.1.0")
+		fmt.Println("gofly " + version)
 		return
 	}
 
@@ -43,6 +49,7 @@ func main() {
 	if *debug {
 		logger.InitDebug()
 	}
+	metrics.SetVersion(version)
 
 	var cfg config.Config
 	var path string
@@ -85,6 +92,19 @@ func main() {
 		if *port > 0 {
 			cfg.Port = *port
 		}
+	}
+
+	if *testConfig {
+		// In file mode config.Load already loaded and validated the config (it
+		// would have exited above on failure); configless config is valid by
+		// construction. Reaching here means the configuration is good.
+		if path != "" {
+			fmt.Printf("gofly: the configuration file %s syntax is ok\n", path)
+		} else {
+			fmt.Println("gofly: configuration is ok")
+		}
+		fmt.Println("gofly: configuration test is successful")
+		return
 	}
 
 	if err := server.Run(cfg, path); err != nil {

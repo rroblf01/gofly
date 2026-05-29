@@ -21,6 +21,7 @@ type Config struct {
 	AccessLog    *bool      `json:"access_log,omitempty"`
 	MemoryLimit  int64      `json:"memory_limit,omitempty"`
 	GOGC         int        `json:"gogc,omitempty"`
+	Metrics      *bool      `json:"metrics,omitempty"`
 	Routes       []Route    `json:"routes"`
 }
 
@@ -38,30 +39,32 @@ type TLSConfig struct {
 }
 
 type Route struct {
-	Path            string            `json:"path"`
-	Host            string            `json:"host,omitempty"`
-	ServerName      string            `json:"server_name,omitempty"`
-	Upstreams       []string          `json:"upstreams,omitempty"`
-	Strategy        string            `json:"strategy,omitempty"`
-	SetHeaders      map[string]string `json:"set_headers,omitempty"`
-	RemoveHeaders   []string          `json:"remove_headers,omitempty"`
-	StaticDir       string            `json:"static_dir,omitempty"`
-	BrowserCacheTTL *Duration         `json:"browser_cache_ttl,omitempty"`
-	Rewrite         string            `json:"rewrite,omitempty"`
-	UpstreamTimeout *Duration         `json:"upstream_timeout,omitempty"`
-	RetryOnError    bool              `json:"retry_on_error,omitempty"`
-	MaxBodySize     int64             `json:"max_body_size,omitempty"`
-	MaxFails        int               `json:"max_fails,omitempty"`
-	FailTimeout     *Duration         `json:"fail_timeout,omitempty"`
-	Gzip            *bool             `json:"gzip,omitempty"`
-	GzipLevel       *int              `json:"gzip_level,omitempty"`
-	GzipMinLength   int               `json:"gzip_min_length,omitempty"`
-	SPA             bool              `json:"spa,omitempty"`
-	AutoIndex       bool              `json:"autoindex,omitempty"`
-	ErrorPages      map[int]string    `json:"error_pages,omitempty"`
-	SecurityHeaders *bool             `json:"security_headers,omitempty"`
-	StaticCacheTTL  *Duration         `json:"static_cache_ttl,omitempty"`
-	Precompressed   *bool             `json:"precompressed,omitempty"`
+	Path                string            `json:"path"`
+	Host                string            `json:"host,omitempty"`
+	ServerName          string            `json:"server_name,omitempty"`
+	Upstreams           []string          `json:"upstreams,omitempty"`
+	Strategy            string            `json:"strategy,omitempty"`
+	SetHeaders          map[string]string `json:"set_headers,omitempty"`
+	RemoveHeaders       []string          `json:"remove_headers,omitempty"`
+	StaticDir           string            `json:"static_dir,omitempty"`
+	BrowserCacheTTL     *Duration         `json:"browser_cache_ttl,omitempty"`
+	Rewrite             string            `json:"rewrite,omitempty"`
+	UpstreamTimeout     *Duration         `json:"upstream_timeout,omitempty"`
+	RetryOnError        bool              `json:"retry_on_error,omitempty"`
+	MaxBodySize         int64             `json:"max_body_size,omitempty"`
+	MaxFails            int               `json:"max_fails,omitempty"`
+	FailTimeout         *Duration         `json:"fail_timeout,omitempty"`
+	HealthCheckPath     string            `json:"health_check_path,omitempty"`
+	HealthCheckInterval *Duration         `json:"health_check_interval,omitempty"`
+	Gzip                *bool             `json:"gzip,omitempty"`
+	GzipLevel           *int              `json:"gzip_level,omitempty"`
+	GzipMinLength       int               `json:"gzip_min_length,omitempty"`
+	SPA                 bool              `json:"spa,omitempty"`
+	AutoIndex           bool              `json:"autoindex,omitempty"`
+	ErrorPages          map[int]string    `json:"error_pages,omitempty"`
+	SecurityHeaders     *bool             `json:"security_headers,omitempty"`
+	StaticCacheTTL      *Duration         `json:"static_cache_ttl,omitempty"`
+	Precompressed       *bool             `json:"precompressed,omitempty"`
 }
 
 type Duration struct {
@@ -173,8 +176,11 @@ func (c *Config) validate() error {
 		if r.StaticDir == "" && len(r.Upstreams) == 0 {
 			return fmt.Errorf("routes[%d]: static_dir or upstreams required", i)
 		}
-		if r.Strategy != "" && r.Strategy != "round_robin" {
-			return fmt.Errorf("routes[%d]: unsupported strategy %q", i, r.Strategy)
+		if r.Strategy != "" && r.Strategy != "round_robin" && r.Strategy != "least_conn" {
+			return fmt.Errorf("routes[%d]: unsupported strategy %q (want round_robin or least_conn)", i, r.Strategy)
+		}
+		if r.HealthCheckInterval != nil && r.HealthCheckInterval.Duration <= 0 {
+			return fmt.Errorf("routes[%d].health_check_interval must be positive", i)
 		}
 		if r.MaxFails < 0 {
 			return fmt.Errorf("routes[%d].max_fails must be non-negative", i)
@@ -194,6 +200,12 @@ func (c *Config) validate() error {
 
 func (c *Config) AccessLogEnabled() bool {
 	return c.AccessLog == nil || *c.AccessLog
+}
+
+// MetricsEnabled reports whether the /metrics endpoint and counters are active.
+// Defaults to true.
+func (c *Config) MetricsEnabled() bool {
+	return c.Metrics == nil || *c.Metrics
 }
 
 func (c *Config) EffectiveMemoryLimit() int64 {

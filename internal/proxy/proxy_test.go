@@ -8,7 +8,9 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/rroblf01/gofly/internal/config"
 	"github.com/rroblf01/gofly/internal/logger"
@@ -285,6 +287,95 @@ func TestRoundRobin_Empty(t *testing.T) {
 	if u != nil {
 		t.Errorf("expected nil, got %v", u)
 	}
+}
+
+func TestProxy_LeastConnPicksLeastLoaded(t *testing.T) {
+	route := config.Route{
+		Path:      "/",
+		Upstreams: []string{"http://a.local", "http://b.local"},
+		Strategy:  "least_conn",
+	}
+	p, err := New(route)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// upstream[0] is busy, upstream[1] is idle.
+	atomic.StoreInt32(&p.upstreams[0].inFlight, 5)
+	atomic.StoreInt32(&p.upstreams[1].inFlight, 0)
+
+	got := p.next()
+	if got != p.upstreams[1] {
+		t.Errorf("least_conn should pick the idle upstream[1], got index %d", got.index)
+	}
+}
+
+func TestProxy_LeastConnSkipsDisabled(t *testing.T) {
+	route := config.Route{
+		Path:      "/",
+		Upstreams: []string{"http://a.local", "http://b.local"},
+		Strategy:  "least_conn",
+	}
+	p, _ := New(route)
+
+	// upstream[1] has fewer connections but is disabled.
+	atomic.StoreInt32(&p.upstreams[0].inFlight, 9)
+	atomic.StoreInt32(&p.upstreams[1].inFlight, 0)
+	atomic.StoreInt32(&p.upstreams[1].disabled, 1)
+
+	got := p.next()
+	if got != p.upstreams[0] {
+		t.Errorf("least_conn must skip disabled upstream, expected upstream[0]")
+	}
+}
+
+func TestProxy_ActiveHealthCheck(t *testing.T) {
+	logger.Init()
+
+	good := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer good.Close()
+
+	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer bad.Close()
+
+	interval := config.Duration{Duration: 20 * time.Millisecond}
+	route := config.Route{
+		Path:                "/",
+		Upstreams:           []string{good.URL, bad.URL},
+		HealthCheckPath:     "/healthz",
+		HealthCheckInterval: &interval,
+	}
+	p, err := New(route)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.Start()
+	defer p.Stop()
+
+	time.Sleep(100 * time.Millisecond)
+
+	status := map[string]bool{}
+	for _, s := range p.Stats() {
+		status[s.URL] = s.Healthy
+	}
+	if !status[good.URL] {
+		t.Errorf("upstream returning 200 should be healthy")
+	}
+	if status[bad.URL] {
+		t.Errorf("upstream returning 503 should be marked unhealthy")
+	}
+}
+
+func TestProxy_HealthCheckNoopWithoutPath(t *testing.T) {
+	route := config.Route{Path: "/", Upstreams: []string{"http://a.local"}}
+	p, _ := New(route)
+	// Start/Stop must be safe no-ops when no health_check_path is configured.
+	p.Start()
+	p.Stop()
 }
 
 func TestScheme_HTTP(t *testing.T) {

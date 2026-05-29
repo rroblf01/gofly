@@ -50,6 +50,14 @@ type UpstreamState struct {
 	failCount int32
 	lastFail  int64
 	disabled  int32
+	inFlight  int32
+}
+
+// UpstreamStatus is a point-in-time snapshot of one upstream, used for metrics.
+type UpstreamStatus struct {
+	URL      string
+	Healthy  bool
+	InFlight int32
 }
 
 type Proxy struct {
@@ -57,10 +65,23 @@ type Proxy struct {
 	upstreams      []*UpstreamState
 	counter        atomic.Uint64
 	reverseproxies []*httputil.ReverseProxy
+	strategy       string
+
+	hcClient *http.Client
+	stopHC   chan struct{}
+	hcWG     sync.WaitGroup
 }
 
 func New(route config.Route) (*Proxy, error) {
-	p := &Proxy{route: route}
+	p := &Proxy{route: route, strategy: route.Strategy}
+
+	if route.HealthCheckPath != "" {
+		timeout := 5 * time.Second
+		if route.HealthCheckInterval != nil && route.HealthCheckInterval.Duration < timeout {
+			timeout = route.HealthCheckInterval.Duration
+		}
+		p.hcClient = &http.Client{Timeout: timeout}
+	}
 
 	for i, u := range route.Upstreams {
 		parsed, err := url.Parse(u)
@@ -108,6 +129,26 @@ func (p *Proxy) next() *UpstreamState {
 		return nil
 	}
 
+	if p.strategy == "least_conn" {
+		// Pick the healthy upstream with the fewest in-flight requests. The
+		// rotating start makes ties round-robin instead of always favoring the
+		// lowest index.
+		start := p.counter.Add(1)
+		var best *UpstreamState
+		var bestLoad int32
+		for k := 0; k < n; k++ {
+			s := p.upstreams[(start+uint64(k))%uint64(n)]
+			if atomic.LoadInt32(&s.disabled) != 0 {
+				continue
+			}
+			load := atomic.LoadInt32(&s.inFlight)
+			if best == nil || load < bestLoad {
+				best, bestLoad = s, load
+			}
+		}
+		return best
+	}
+
 	for range n {
 		i := p.counter.Add(1) - 1
 		state := p.upstreams[i%uint64(n)]
@@ -130,6 +171,9 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if us, ok := w.(UpstreamSetter); ok {
 		us.SetUpstream(up.url.String())
 	}
+
+	atomic.AddInt32(&up.inFlight, 1)
+	defer atomic.AddInt32(&up.inFlight, -1)
 
 	if isWebSocket(r) {
 		p.serveWebSocket(w, r, up.url)
@@ -245,6 +289,84 @@ func (p *Proxy) UpstreamURL() string {
 		return ""
 	}
 	return p.upstreams[0].url.String()
+}
+
+// Path returns the route path this proxy serves (used for metric labels).
+func (p *Proxy) Path() string { return p.route.Path }
+
+// Stats returns a snapshot of every upstream's health and in-flight count.
+func (p *Proxy) Stats() []UpstreamStatus {
+	out := make([]UpstreamStatus, 0, len(p.upstreams))
+	for _, s := range p.upstreams {
+		out = append(out, UpstreamStatus{
+			URL:      s.url.String(),
+			Healthy:  atomic.LoadInt32(&s.disabled) == 0,
+			InFlight: atomic.LoadInt32(&s.inFlight),
+		})
+	}
+	return out
+}
+
+// Start launches the active health-check loop if health_check_path is set.
+// It is a no-op otherwise. Stop must be called to release the goroutine.
+func (p *Proxy) Start() {
+	if p.hcClient == nil {
+		return
+	}
+	interval := 10 * time.Second
+	if p.route.HealthCheckInterval != nil {
+		interval = p.route.HealthCheckInterval.Duration
+	}
+	p.stopHC = make(chan struct{})
+	p.hcWG.Add(1)
+	go func() {
+		defer p.hcWG.Done()
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		p.runHealthChecks() // probe immediately at startup
+		for {
+			select {
+			case <-t.C:
+				p.runHealthChecks()
+			case <-p.stopHC:
+				return
+			}
+		}
+	}()
+}
+
+// Stop terminates the active health-check loop and waits for it to exit.
+func (p *Proxy) Stop() {
+	if p.stopHC != nil {
+		close(p.stopHC)
+		p.hcWG.Wait()
+		p.stopHC = nil
+	}
+}
+
+func (p *Proxy) runHealthChecks() {
+	for _, s := range p.upstreams {
+		target := strings.TrimRight(s.url.String(), "/") + p.route.HealthCheckPath
+		healthy := false
+		if req, err := http.NewRequest(http.MethodGet, target, nil); err == nil {
+			if resp, err := p.hcClient.Do(req); err == nil {
+				io.Copy(io.Discard, resp.Body)
+				resp.Body.Close()
+				healthy = resp.StatusCode >= 200 && resp.StatusCode < 400
+			}
+		}
+
+		if healthy {
+			if atomic.SwapInt32(&s.disabled, 0) == 1 {
+				logger.Info("upstream healthy (active check)", logger.LogFields{"upstream": s.url.String()})
+			}
+			atomic.StoreInt32(&s.failCount, 0)
+		} else {
+			if atomic.SwapInt32(&s.disabled, 1) == 0 {
+				logger.Warn("upstream unhealthy (active check)", logger.LogFields{"upstream": s.url.String()})
+			}
+		}
+	}
 }
 
 func isWebSocket(r *http.Request) bool {

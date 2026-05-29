@@ -1,6 +1,29 @@
 # Changelog
 
-## Unreleased
+## v1.0.0 (2026-05-29)
+
+First stable release. From this version the JSON config schema and CLI flags are
+covered by [SemVer](https://semver.org/): no incompatible changes within `1.x`.
+
+### Features
+
+- **HTTP/2** — negotiated automatically over TLS (ALPN `h2`); plaintext stays HTTP/1.1. No config needed.
+- **Prometheus metrics** — new `/metrics` endpoint (text exposition format, zero-dependency) exposing request counts by status class, in-flight requests, response bytes, cumulative request duration, goroutine/heap gauges, and per-upstream health/in-flight. Toggle with `"metrics": false`.
+- **Active health checks** — `health_check_path` + `health_check_interval` periodically probe each upstream and toggle it in/out of rotation, complementing the existing passive detection.
+- **`least_conn` load balancing** — new `strategy` value that routes to the healthy upstream with the fewest in-flight requests (round-robin tie-break).
+- **`gofly -t`** — load and validate the configuration, then exit; non-zero on error (like `nginx -t`). Wired into the systemd unit's `ExecStartPre`.
+- **Build version injection** — `-version` now reports the real build version via `-ldflags -X main.version`, also surfaced as `gofly_build_info`.
+
+### Operability
+
+- `SECURITY.md` with reporting policy and a deployment threat-model note (notably the trust boundary around `X-Forwarded-For`).
+- `deploy/gofly.service` systemd unit: validates config before start, `SIGHUP` reload, runs unprivileged with `CAP_NET_BIND_SERVICE` and a hardened sandbox.
+- CI workflow running gofmt, `go vet`, `go test -race`, build, and a zero-dependency guard on `go.mod`.
+
+### Fixes
+
+- **Trailing-slash route panic** — a proxy/static route whose `path` already ended in `/` (e.g. `/api/`, as in the example config) registered the same `ServeMux` pattern twice and panicked at startup. Fixed; the example `config.json` now boots.
+- `X-Forwarded-For` is now the clean client IP (no port, no duplication) — delegated to `httputil.ReverseProxy` on the proxy path and set explicitly with proper chaining on the WebSocket path.
 
 ### Performance
 
@@ -14,12 +37,8 @@
 
 ### Options added
 
-- `static_cache_ttl`, `precompressed` (default `true`), `gzip_level`, `gzip_min_length` (route)
-- `gogc`, `memory_limit` (global), `rate_limit.idle_ttl`
-
-### Fixes
-
-- `X-Forwarded-For` is now the clean client IP (no port, no duplication) — delegated to `httputil.ReverseProxy` on the proxy path and set explicitly with proper chaining on the WebSocket path.
+- Route: `static_cache_ttl`, `precompressed` (default `true`), `gzip_level`, `gzip_min_length`, `strategy: "least_conn"`, `health_check_path`, `health_check_interval`
+- Global: `gogc`, `metrics` (default `true`), `rate_limit.idle_ttl`
 
 ## v0.1.0 (2026-05-29)
 

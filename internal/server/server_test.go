@@ -346,6 +346,60 @@ func TestGzipMiddleware(t *testing.T) {
 	})
 }
 
+func TestServer_MetricsEndpoint(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok"))
+	}))
+	defer backend.Close()
+
+	cfg := config.Config{
+		Port: 0,
+		Routes: []config.Route{
+			{Path: "/api", Upstreams: []string{backend.URL}},
+		},
+	}
+	srv := New(cfg)
+
+	// serve a request so counters are non-zero
+	srv.middleware(srv.mux).ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/health", nil))
+
+	rec := httptest.NewRecorder()
+	srv.mux.ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	body := rec.Body.String()
+	for _, want := range []string{
+		"gofly_build_info",
+		"gofly_requests_total",
+		"gofly_requests_in_flight",
+		"gofly_response_bytes_total",
+		"gofly_goroutines",
+		"gofly_upstream_healthy",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("metrics output missing %q", want)
+		}
+	}
+}
+
+func TestServer_MetricsDisabled(t *testing.T) {
+	off := false
+	cfg := config.Config{
+		Port:    0,
+		Metrics: &off,
+		Routes:  []config.Route{},
+	}
+	srv := New(cfg)
+
+	rec := httptest.NewRecorder()
+	srv.mux.ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want %d (/metrics should be absent when disabled)", rec.Code, http.StatusNotFound)
+	}
+}
+
 func TestServer_TrailingSlashRouteNoPanic(t *testing.T) {
 	// A proxy route whose path already ends in "/" must not double-register the
 	// same ServeMux pattern (which would panic at startup).

@@ -1,0 +1,48 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+
+      - name: Verify zero dependencies
+        run: |
+          # go.mod must declare no require block (pure stdlib).
+          if grep -q '^require' go.mod; then
+            echo "go.mod has external dependencies; gofly must stay zero-dep" >&2
+            exit 1
+          fi
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt-clean:" >&2
+            echo "$unformatted" >&2
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: Test (race)
+        run: go test -race -count=1 ./...
+
+      - name: Build
+        run: CGO_ENABLED=0 go build -ldflags="-s -w -X main.version=${GITHUB_REF_NAME}" -trimpath -o /tmp/gofly ./cmd/gofly
+
+      - name: Config test flag
+        run: /tmp/gofly -t -config config.json

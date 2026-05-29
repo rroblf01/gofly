@@ -2,6 +2,7 @@ FROM golang:1.26-alpine AS builder
 
 ARG TARGETOS=linux
 ARG TARGETARCH=amd64
+ARG VERSION=dev
 
 RUN apk add --no-cache ca-certificates
 
@@ -11,7 +12,7 @@ COPY go.mod ./
 COPY . .
 
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
-    go build -ldflags="-s -w" -trimpath \
+    go build -ldflags="-s -w -X main.version=${VERSION}" -trimpath \
     -o /usr/local/bin/gofly ./cmd/gofly/
 
 FROM scratch

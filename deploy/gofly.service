@@ -1,0 +1,43 @@
+# systemd unit for gofly. Install to /etc/systemd/system/gofly.service
+# then: systemctl daemon-reload && systemctl enable --now gofly
+#
+# Reload config without downtime:  systemctl reload gofly   (sends SIGHUP)
+# Validate config before reload:   gofly -t -config /etc/gofly/config.json
+
+[Unit]
+Description=gofly HTTP reverse proxy and static file server
+Documentation=https://github.com/rroblf01/gofly
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStartPre=/usr/local/bin/gofly -t -config /etc/gofly/config.json
+ExecStart=/usr/local/bin/gofly -config /etc/gofly/config.json
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=2s
+
+# Bind to privileged ports (80/443) without running as root.
+User=gofly
+Group=gofly
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+# Allow read access to the static root / certs as needed, e.g.:
+# ReadOnlyPaths=/etc/gofly /var/www
+
+[Install]
+WantedBy=multi-user.target

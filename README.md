@@ -4,10 +4,14 @@ A fast, lightweight HTTP reverse proxy and static file server written in Go. Des
 
 ## Features
 
-- **Reverse proxy** with round-robin load balancing
+- **Reverse proxy** with `round_robin` or `least_conn` load balancing
 - **WebSocket support** — transparent WebSocket proxying
-- **Passive health checks** — auto-disable failing upstreams, re-enable after cooldown
+- **HTTP/2** — negotiated automatically on the TLS listener (HTTP/1.1 on plaintext)
+- **Active + passive health checks** — periodic probing (`health_check_path`) plus auto-disable of failing upstreams with cooldown
+- **Prometheus metrics** — `/metrics` endpoint in text exposition format (requests, bytes, latency, in-flight, per-upstream health)
 - **Retry on failure** — failover to next upstream on connection errors
+- **In-memory static cache** — optional `static_cache_ttl` serves small files from RAM
+- **Config test** — `gofly -t` validates the config without starting
 - **Upstream timeouts** — configurable `upstream_timeout` per route
 - **Path rewriting** — rewrite request paths before forwarding to upstreams
 - **Host-based routing** — route by `server_name` (virtual hosts)
@@ -181,6 +185,7 @@ gofly uses a single JSON config file. Default path: `/etc/gofly/config.json` (ov
 | `max_body_size` | int | `0` (unlimited) | Max request body size in bytes |
 | `memory_limit` | int | `104857600` (100 MB) | Soft heap limit in bytes (`debug.SetMemoryLimit`) |
 | `gogc` | int | — | `GOGC` percent (`debug.SetGCPercent`); higher = fewer GC cycles, more RAM |
+| `metrics` | bool | `true` | Expose the `/metrics` endpoint and record counters |
 | `rate_limit` | object | — | Global rate limiting config |
 | `rate_limit.requests_per_second` | float | — | Requests per second per IP |
 | `rate_limit.burst` | int | — | Burst capacity |
@@ -194,7 +199,9 @@ gofly uses a single JSON config file. Default path: `/etc/gofly/config.json` (ov
 | `path` | string | — | URL path pattern (e.g. `/api/`, `/`) |
 | `server_name` | string | — | Match requests by Host header (virtual host) |
 | `upstreams` | []string | — | Backend URLs for reverse proxy |
-| `strategy` | string | `"round_robin"` | Load balancing strategy |
+| `strategy` | string | `"round_robin"` | Load balancing: `round_robin` or `least_conn` (fewest in-flight) |
+| `health_check_path` | string | — | If set, actively probe this path on each upstream and toggle health |
+| `health_check_interval` | string | `"10s"` | Interval between active health probes |
 | `static_dir` | string | — | Directory to serve static files from |
 | `static_cache_ttl` | string | — | Cache small files (≤1 MiB) in memory for this TTL, skipping open/stat/read syscalls. Takes precedence over `precompressed`. |
 | `precompressed` | bool | `true` | Probe for a sibling `.gz` file when the client accepts gzip. Set `false` to skip the stat syscall on routes without pre-compressed assets. |
@@ -224,6 +231,23 @@ The following variables are expanded in `set_headers`, `host`, and `rewrite`:
 | `$uri` | Request URI path |
 | `$request_uri` | Full request URI (path + query) |
 
+## CLI flags
+
+| Flag | Description |
+|---|---|
+| `-config <path>` | Path to the JSON config file (default `/etc/gofly/config.json`, or `$GOFLY_CONFIG`) |
+| `-root <dir>` | Configless mode: serve a static directory, no config file needed |
+| `-port <n>` | Override the listen port |
+| `-t` | Test (load + validate) the configuration and exit; non-zero on error |
+| `-debug` | Enable debug-level logging |
+| `-version` | Print the build version and exit |
+| `-health` | Perform a TCP health check against a running instance (used by Docker `HEALTHCHECK`) |
+
+```bash
+gofly -t -config /etc/gofly/config.json   # validate before deploy/reload
+gofly -version                            # e.g. "gofly v1.0.0"
+```
+
 ## API
 
 ### Health check
@@ -233,6 +257,32 @@ GET /health
 ```
 
 Returns `{"status":"ok"}` with HTTP 200.
+
+### Metrics
+
+```
+GET /metrics
+```
+
+Prometheus text exposition format (enabled by default; disable with `"metrics": false`):
+
+```
+gofly_build_info{version="v1.0.0"} 1
+gofly_requests_total{status_class="2xx"} 12345
+gofly_requests_in_flight 3
+gofly_response_bytes_total 9876543
+gofly_request_duration_seconds_sum 42.123456
+gofly_request_duration_seconds_count 12345
+gofly_goroutines 24
+gofly_heap_alloc_bytes 12582912
+gofly_upstream_healthy{route="/api",upstream="http://10.0.0.1:8080"} 1
+gofly_upstream_in_flight{route="/api",upstream="http://10.0.0.1:8080"} 2
+```
+
+### HTTP/2
+
+HTTP/2 is negotiated automatically over TLS (ALPN `h2`); plaintext connections
+use HTTP/1.1. No configuration required — just enable `tls`.
 
 ## Docker
 
@@ -343,36 +393,42 @@ Same static page (`www/index.html`, 672 B), same machine for every row
 
 | Config | Requests/s | Latency (avg) | Memory (RSS) |
 |---|---|---|---|
-| gofly (1 worker, access_log off) | 88,053 | 1.26 ms | ~22 MB |
-| gofly (SO_REUSEPORT ×16, access_log off) | 92,440 | 1.22 ms | ~22 MB |
-| gofly (×16, GOGC=off, GOMEMLIMIT=200MiB) | 105,691 | 0.91 ms | ~92 MB |
-| gofly (×16, **static_cache_ttl**, default GC) | 148,502 | 0.72 ms | **~22 MB** |
-| gofly (×16, **static_cache_ttl**, GOGC=off, GOMEMLIMIT=200MiB) | **192,872** | **0.43 ms** | ~96 MB |
-| **nginx alpine** (`worker_processes auto`) | **201,084** | 0.46 ms | ~77 MB (17 procs) |
+| gofly (1 worker, access_log off) | 85,106 | 1.35 ms | ~23 MB |
+| gofly (SO_REUSEPORT ×16, access_log off) | 86,812 | 1.36 ms | ~24 MB |
+| gofly (×16, GOGC=off, GOMEMLIMIT=200MiB) | 103,228 | 0.92 ms | ~94 MB |
+| gofly (×16, **static_cache_ttl**, default GC) | 146,920 | 0.77 ms | **~22 MB** |
+| gofly (×16, **static_cache_ttl**, GOGC=off, GOMEMLIMIT=200MiB) | 182,676 | 0.53 ms | ~95 MB |
+| gofly (×16, **static_cache_ttl**, GOGC=off, **metrics off**) | **193,881** | **0.44 ms** | ~97 MB |
+| **nginx alpine** (`worker_processes auto`) | **200,450** | 0.50 ms | ~76 MB (17 procs) |
+
+All gofly rows include the default-on `/metrics` wrapper except the last; the
+metrics path costs ~5% throughput, so set `"metrics": false` when you want every
+last request/second.
 
 The in-memory static cache (`static_cache_ttl`) is the headline change: it skips
 the per-request `open`/`stat`/`read` syscalls and serves small files straight
-from memory, lifting gofly from ~53% to **96% of nginx throughput** with **lower
-average latency** (0.43 ms vs 0.46 ms). With the default GC it delivers **74% of
-nginx throughput at ~22 MB RSS** — under a third of nginx's footprint.
+from memory, lifting gofly from ~53% to **91% of nginx throughput** with metrics
+on (**97%** with metrics off, at **lower latency** — 0.44 ms vs 0.50 ms). With
+the default GC it delivers **73% of nginx throughput at ~22 MB RSS** — under a
+third of nginx's footprint.
 
 ### Comparison with nginx
 
-Best gofly config (×16 workers, `static_cache_ttl`, GOGC=off + GOMEMLIMIT=200MiB) vs nginx alpine:
+Best gofly config (×16 workers, `static_cache_ttl`, GOGC=off + GOMEMLIMIT=200MiB, metrics off) vs nginx alpine:
 
 | Metric | gofly (scratch) | nginx (alpine) | Difference |
 |---|---|---|---|
-| **Requests/sec** | 192,872 | 201,084 | -4% |
-| **Latency (avg)** | **0.43 ms** | 0.46 ms | **-7%** 🏆 |
+| **Requests/sec** | 193,881 | 200,450 | -3% |
+| **Latency (avg)** | **0.44 ms** | 0.50 ms | **-12%** 🏆 |
 | **Image size** | **~7 MB** | ~35 MB | **5× smaller** 🏆 |
 | **Dependencies** | **0** (pure stdlib) | libc, PCRE, zlib, OpenSSL | **—** 🏆 |
 | **Static binary** | ✅ Yes | ❌ No | **—** 🏆 |
 | **Memory safety** | ✅ Yes (Go) | ❌ No (C) | **—** 🏆 |
 | **Configuration** | **JSON (simple)** | nginx.conf | **—** 🏆 |
 
-> With the static cache enabled, gofly delivers **96% of nginx throughput at
-> lower average latency**, while being **5× smaller**, **zero dependencies**, and
-> **memory-safe by construction**.
+> With the static cache enabled, gofly delivers **97% of nginx throughput at
+> lower average latency** (91% with metrics on), while being **5× smaller**,
+> **zero dependencies**, and **memory-safe by construction**.
 
 ### Memory usage
 
@@ -490,6 +546,37 @@ Full client→server→loopback round trips via `httptest`, AMD Ryzen 7 5700U
               └──────────────────────────┘
 ```
 
+## Versioning & stability
+
+gofly follows [Semantic Versioning](https://semver.org/). From **1.0.0** onward:
+
+- The **JSON config schema** (field names and semantics) and the **CLI flags**
+  are part of the public API. They will not change incompatibly within a major
+  version; new fields are added in a backward-compatible way.
+- A config that loads on `1.x` will keep loading on every later `1.y`.
+- The `/metrics` metric names follow Prometheus conventions and are kept stable
+  within a major version.
+- Not yet covered by the stability guarantee (may change in a minor release):
+  the access-log JSON field set and the autoindex HTML output.
+
+Validate a config against the running version with `gofly -t -config <path>`.
+
+## Roadmap (post-1.0)
+
+Deliberately **out of scope for 1.0**, planned for later `1.x`:
+
+- ACME / Let's Encrypt automatic certificates
+- HTTP/3 (QUIC)
+- Brotli compression
+- Response/content caching (proxy cache)
+- Weighted load balancing and `ip_hash`
+- IP allow/deny lists and basic auth
+
+These would be added without breaking the 1.0 config contract. Keeping them out
+of 1.0 is intentional: the goal is a small, stable core with **zero external
+dependencies** (some of the above, e.g. HTTP/3, would require adding one).
+
 ## License
 
 MIT
+

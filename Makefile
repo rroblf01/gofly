@@ -1,7 +1,7 @@
 BINARY=gofly
 BUILD_DIR=build
-GOFLAGS=-ldflags="-s -w" -trimpath
-VERSION=$(shell git describe --tags --always --dirty 2>/dev/null || echo "v0.1.0")
+VERSION=$(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
+GOFLAGS=-ldflags="-s -w -X main.version=$(VERSION)" -trimpath
 
 .PHONY: all build test test-race test-cover clean docker docker-slim run lint cross
 

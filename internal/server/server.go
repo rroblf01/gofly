@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/rroblf01/gofly/internal/config"
 	"github.com/rroblf01/gofly/internal/logger"
+	"github.com/rroblf01/gofly/internal/metrics"
 	"github.com/rroblf01/gofly/internal/proxy"
 	"github.com/rroblf01/gofly/internal/static"
 )
@@ -44,6 +46,7 @@ type Server struct {
 	stopRL     chan struct{}
 	listeners  []net.Listener
 	sh         *swappableHandler
+	proxies    []*proxy.Proxy
 }
 
 type swappableHandler struct {
@@ -176,6 +179,7 @@ func New(cfg config.Config) *Server {
 
 	handler := s.buildMiddleware(mux)
 	s.startRateLimitJanitor()
+	s.startHealthChecks()
 
 	s.http = &http.Server{
 		Addr:         fmt.Sprintf(":%d", cfg.Port),
@@ -211,6 +215,8 @@ func (s *Server) buildMiddleware(mux *http.ServeMux) http.Handler {
 }
 
 func (s *Server) rebuildHandler() {
+	s.stopHealthChecks() // tear down checkers bound to the previous proxies
+
 	mux := http.NewServeMux()
 	s.mux = mux
 	s.registerRoutes()
@@ -226,6 +232,22 @@ func (s *Server) rebuildHandler() {
 	}
 
 	s.sh.Swap(handler)
+	s.startHealthChecks()
+}
+
+// startHealthChecks starts active upstream probing for every proxy that
+// configured it. No-op for proxies without health_check_path.
+func (s *Server) startHealthChecks() {
+	for _, p := range s.proxies {
+		p.Start()
+	}
+}
+
+// stopHealthChecks stops all active health-check loops and waits for them.
+func (s *Server) stopHealthChecks() {
+	for _, p := range s.proxies {
+		p.Stop()
+	}
 }
 
 // startRateLimitJanitor periodically evicts idle per-IP buckets so the rate
@@ -258,6 +280,7 @@ func (s *Server) startRateLimitJanitor() {
 }
 
 func (s *Server) registerRoutes() {
+	s.proxies = nil
 	for _, route := range s.cfg.Routes {
 		route := route
 		switch {
@@ -287,6 +310,7 @@ func (s *Server) registerRoutes() {
 				})
 				continue
 			}
+			s.proxies = append(s.proxies, p)
 			var h http.Handler = p
 			if gzipEnabled(route) {
 				h = gzipMiddlewareWith(h, route.GzipCompressionLevel(), route.GzipMinLength)
@@ -310,6 +334,55 @@ func (s *Server) registerRoutes() {
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprint(w, `{"status":"ok"}`)
 	})
+
+	if s.cfg.MetricsEnabled() {
+		s.mux.HandleFunc("GET /metrics", s.metricsHandler)
+	}
+}
+
+// metricsHandler exposes process metrics plus per-upstream gauges in the
+// Prometheus text exposition format.
+func (s *Server) metricsHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	metrics.WriteTo(w)
+
+	if len(s.proxies) == 0 {
+		return
+	}
+	var b []byte
+	b = append(b, "# HELP gofly_upstream_healthy Upstream health (1=healthy, 0=disabled).\n"...)
+	b = append(b, "# TYPE gofly_upstream_healthy gauge\n"...)
+	for _, p := range s.proxies {
+		route := metrics.EscapeLabel(p.Path())
+		for _, st := range p.Stats() {
+			b = append(b, `gofly_upstream_healthy{route="`...)
+			b = append(b, route...)
+			b = append(b, `",upstream="`...)
+			b = append(b, metrics.EscapeLabel(st.URL)...)
+			b = append(b, `"} `...)
+			if st.Healthy {
+				b = append(b, '1')
+			} else {
+				b = append(b, '0')
+			}
+			b = append(b, '\n')
+		}
+	}
+	b = append(b, "# HELP gofly_upstream_in_flight In-flight requests per upstream.\n"...)
+	b = append(b, "# TYPE gofly_upstream_in_flight gauge\n"...)
+	for _, p := range s.proxies {
+		route := metrics.EscapeLabel(p.Path())
+		for _, st := range p.Stats() {
+			b = append(b, `gofly_upstream_in_flight{route="`...)
+			b = append(b, route...)
+			b = append(b, `",upstream="`...)
+			b = append(b, metrics.EscapeLabel(st.URL)...)
+			b = append(b, `"} `...)
+			b = strconv.AppendInt(b, int64(st.InFlight), 10)
+			b = append(b, '\n')
+		}
+	}
+	w.Write(b)
 }
 
 func (s *Server) hostHandler(serverName string, handler http.Handler) http.HandlerFunc {
@@ -366,14 +439,24 @@ func (s *Server) startLogWorker() {
 }
 
 func (s *Server) middleware(next http.Handler) http.Handler {
-	if !s.cfg.AccessLogEnabled() {
+	metricsOn := s.cfg.MetricsEnabled()
+	logOn := s.cfg.AccessLogEnabled()
+
+	// Zero-cost path: skip the wrapper entirely only when nothing observes it.
+	if !metricsOn && !logOn {
 		return next
 	}
+
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 
 		lrw := newResponseWriter(w)
 		defer putResponseWriter(lrw)
+
+		if metricsOn {
+			metrics.IncInFlight()
+			defer metrics.DecInFlight()
+		}
 
 		if id := r.Header.Get("X-Request-ID"); id != "" {
 			r = r.WithContext(logger.WithRequestID(r.Context(), id))
@@ -381,9 +464,15 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 
 		next.ServeHTTP(lrw, r)
 
-		select {
-		case s.logCh <- logEntry{start, r.Method, r.URL.Path, lrw.status, time.Since(start), lrw.upstream}:
-		default:
+		dur := time.Since(start)
+		if metricsOn {
+			metrics.Observe(lrw.status, lrw.bytes, dur.Nanoseconds())
+		}
+		if logOn {
+			select {
+			case s.logCh <- logEntry{start, r.Method, r.URL.Path, lrw.status, dur, lrw.upstream}:
+			default:
+			}
 		}
 	})
 }
@@ -441,6 +530,7 @@ func (s *Server) ListenAndServe() error {
 }
 
 func (s *Server) Shutdown(ctx context.Context) error {
+	s.stopHealthChecks()
 	err := s.http.Shutdown(ctx)
 	close(s.stopLog)
 	close(s.stopRL)
@@ -510,6 +600,7 @@ type responseWriter struct {
 	status   int
 	upstream string
 	written  bool
+	bytes    int64
 }
 
 var rwPool = sync.Pool{
@@ -524,6 +615,7 @@ func newResponseWriter(w http.ResponseWriter) *responseWriter {
 	rw.status = http.StatusOK
 	rw.upstream = ""
 	rw.written = false
+	rw.bytes = 0
 	return rw
 }
 
@@ -548,17 +640,26 @@ func (rw *responseWriter) Write(b []byte) (int, error) {
 	if !rw.written {
 		rw.WriteHeader(http.StatusOK)
 	}
-	return rw.ResponseWriter.Write(b)
+	n, err := rw.ResponseWriter.Write(b)
+	rw.bytes += int64(n)
+	return n, err
 }
 
 func (rw *responseWriter) ReadFrom(r io.Reader) (int64, error) {
 	if !rw.written {
 		rw.WriteHeader(http.StatusOK)
 	}
+	var (
+		n   int64
+		err error
+	)
 	if rf, ok := rw.ResponseWriter.(io.ReaderFrom); ok {
-		return rf.ReadFrom(r)
+		n, err = rf.ReadFrom(r)
+	} else {
+		n, err = io.Copy(rw.ResponseWriter, r)
 	}
-	return io.Copy(rw.ResponseWriter, r)
+	rw.bytes += n
+	return n, err
 }
 
 func extractIP(r *http.Request) string {

@@ -12,9 +12,10 @@
     {
       "path": "/api/",
       "upstreams": ["http://localhost:3001", "http://localhost:3002"],
-      "strategy": "round_robin",
+      "strategy": "least_conn",
+      "health_check_path": "/health",
+      "health_check_interval": "10s",
       "set_headers": {
-        "X-Forwarded-For": "$remote_addr",
         "X-Real-IP": "$remote_addr"
       },
       "retry_on_error": true,
