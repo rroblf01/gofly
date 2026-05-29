@@ -25,7 +25,7 @@ func BenchmarkServer_StaticFile(b *testing.B) {
 	os.WriteFile(www+"/style.css", []byte("body{}"), 0644)
 
 	cfg := config.Config{
-		Port:   0,
+		Port: 0,
 		Routes: []config.Route{
 			{Path: "/", StaticDir: www},
 		},
@@ -107,7 +107,7 @@ func BenchmarkServer_RateLimitEnabled(b *testing.B) {
 
 	srv := New(cfg)
 
-	handler := srv.rateLimitMiddleware(srv.middleware(srv.mux))
+	handler := srv.rateLimitMiddleware(srv.rl.Load(), srv.middleware(srv.mux))
 	ts := &http.Server{
 		Addr:    ":0",
 		Handler: handler,
@@ -145,7 +145,7 @@ func BenchmarkServer_ConcurrentStatic(b *testing.B) {
 	}
 
 	cfg := config.Config{
-		Port:   0,
+		Port: 0,
 		Routes: []config.Route{
 			{Path: "/", StaticDir: www},
 		},
@@ -190,7 +190,7 @@ func BenchmarkMemory_ServerIdle(b *testing.B) {
 	os.WriteFile(www+"/index.html", []byte(benchPageHTML), 0644)
 
 	cfg := config.Config{
-		Port:   0,
+		Port: 0,
 		Routes: []config.Route{
 			{Path: "/", StaticDir: www},
 		},

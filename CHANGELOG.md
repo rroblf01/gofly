@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased
+
+### Performance
+
+- **In-memory static cache** — new `static_cache_ttl` route option holds resolved small files (≤1 MiB, ≤4096 entries) in memory and serves them from a `bytes.Reader`, skipping the per-request `open`/`stat`/`read` syscalls. Conditional requests and byte ranges are served from the cached copy. In load tests this lifts gofly from ~53% to **96% of nginx throughput** (192,872 vs 201,084 req/s) at **lower average latency** (0.43 ms vs 0.46 ms), or **74% of nginx throughput at ~22 MB RSS** with the default GC.
+- **Pooled gzip writers** — `sync.Pool` per compression level reuses the compressor window instead of allocating ~256 KiB on every gzipped response. New `gzip_level` and `gzip_min_length` route options (the latter sends small bodies uncompressed). Gzip now also strips the stale `Content-Length` so compressed responses are correct over the wire.
+- **Tuned upstream transport** — `MaxIdleConnsPerHost` 10 → 256, `MaxIdleConns` 1024, `ForceAttemptHTTP2`, and 64 KiB read/write buffers reduce connection churn under reverse-proxy load.
+- **Sharded, bounded rate limiter** — per-IP buckets are spread across 256 independently-locked shards (was a single `RWMutex`), and a background janitor evicts idle buckets after `rate_limit.idle_ttl` (default 10m), fixing unbounded memory growth under a wide or spoofed client base.
+- **Pooled WebSocket relay buffers** — the two `io.Copy` directions reuse pooled 32 KiB buffers instead of allocating per connection.
+- **Allocation-free static hot path** — ETag and `Content-Range` built with `strconv.AppendInt` (no `fmt.Sprintf`); the static root is resolved to absolute once at startup, removing a per-request `filepath.Abs`/`os.Getwd` syscall.
+- **Configurable GC** — new `gogc` config field maps to `debug.SetGCPercent`.
+
+### Options added
+
+- `static_cache_ttl`, `precompressed` (default `true`), `gzip_level`, `gzip_min_length` (route)
+- `gogc`, `memory_limit` (global), `rate_limit.idle_ttl`
+
+### Fixes
+
+- `X-Forwarded-For` is now the clean client IP (no port, no duplication) — delegated to `httputil.ReverseProxy` on the proxy path and set explicitly with proper chaining on the WebSocket path.
+
 ## v0.1.0 (2026-05-29)
 
 ### Features

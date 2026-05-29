@@ -1,6 +1,7 @@
 package static
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"mime"
@@ -24,28 +25,40 @@ var sniffPool = sync.Pool{
 }
 
 type Handler struct {
-	root       string
-	prefix     string
-	cacheTTL   string
-	setHeaders map[string]string
-	spa        bool
-	autoindex  bool
-	errorPages map[int]string
-	secHeaders bool
+	root          string
+	prefix        string
+	cacheTTL      string
+	setHeaders    map[string]string
+	spa           bool
+	autoindex     bool
+	errorPages    map[int]string
+	secHeaders    bool
+	precompressed bool
+	cache         *fileCache
 }
 
 func New(route config.Route) *Handler {
+	root := route.StaticDir
+	if abs, err := filepath.Abs(root); err == nil {
+		root = abs
+	}
+	root = filepath.Clean(root)
+
 	h := &Handler{
-		root:       route.StaticDir,
-		prefix:     route.Path,
-		setHeaders: route.SetHeaders,
-		spa:        route.SPA,
-		autoindex:  route.AutoIndex,
-		errorPages: route.ErrorPages,
-		secHeaders: route.SecurityHeadersDefault(),
+		root:          root,
+		prefix:        route.Path,
+		setHeaders:    route.SetHeaders,
+		spa:           route.SPA,
+		autoindex:     route.AutoIndex,
+		errorPages:    route.ErrorPages,
+		secHeaders:    route.SecurityHeadersDefault(),
+		precompressed: route.PrecompressedEnabled(),
 	}
 	if route.BrowserCacheTTL != nil {
 		h.cacheTTL = "public, max-age=" + strconv.FormatInt(int64(route.BrowserCacheTTL.Seconds()), 10)
+	}
+	if route.StaticCacheTTL != nil && route.StaticCacheTTL.Duration > 0 {
+		h.cache = newFileCache(route.StaticCacheTTL.Duration)
 	}
 	return h
 }
@@ -57,15 +70,20 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	target, err := filepath.Abs(filepath.Join(h.root, path))
-	if err != nil {
-		h.serveError(w, r, http.StatusInternalServerError)
+	// h.root is already absolute and clean; filepath.Join cleans the result, so
+	// no per-request filepath.Abs (and its os.Getwd syscall) is needed.
+	target := filepath.Join(h.root, path)
+
+	if target != h.root && !strings.HasPrefix(target, h.root+string(filepath.Separator)) {
+		h.serveError(w, r, http.StatusForbidden)
 		return
 	}
 
-	if target != h.root && !strings.HasPrefix(target, h.root+"/") {
-		h.serveError(w, r, http.StatusForbidden)
-		return
+	if h.cache != nil {
+		if e, ok := h.cache.get(target); ok {
+			h.serveContent(w, r, bytes.NewReader(e.data), int64(len(e.data)), e.modTime, e.etag, e.ctype)
+			return
+		}
 	}
 
 	f, err := os.Open(target)
@@ -132,18 +150,83 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		target = filepath.Join(target, "index.html")
 	}
 
-	if gz, ok := precompressedGzip(r, target); ok {
-		defer gz.f.Close()
-		h.serveFile(w, r, gz.f, gz.stat, gz.orig)
+	// When the in-memory cache is enabled it takes precedence over
+	// pre-compressed siblings (it serves identity content for every client),
+	// so the .gz probe is skipped entirely.
+	if h.cache == nil {
+		if h.precompressed {
+			if gz, ok := precompressedGzip(r, target); ok {
+				defer gz.f.Close()
+				h.serveFile(w, r, gz.f, gz.stat, gz.orig)
+				return
+			}
+		}
+		h.serveFile(w, r, f, stat, target)
 		return
 	}
 
-	h.serveFile(w, r, f, stat, target)
+	h.serveAndMaybeCache(w, r, f, stat, target)
+}
+
+// maxCacheFileSize bounds which files are eligible to be held in memory by the
+// optional static cache. Larger files are always streamed from disk.
+const maxCacheFileSize = 1 << 20 // 1 MiB
+
+// serveAndMaybeCache serves a regular file and, when small enough, reads it once
+// into the in-memory cache so subsequent requests avoid the open/stat/read
+// syscalls entirely.
+func (h *Handler) serveAndMaybeCache(w http.ResponseWriter, r *http.Request, f *os.File, stat os.FileInfo, origName string) {
+	if !stat.Mode().IsRegular() || stat.Size() > maxCacheFileSize {
+		h.serveFile(w, r, f, stat, origName)
+		return
+	}
+
+	data := make([]byte, stat.Size())
+	if _, err := io.ReadFull(f, data); err != nil {
+		// Fall back to a fresh streaming read from offset 0.
+		if _, seekErr := f.Seek(0, io.SeekStart); seekErr == nil {
+			h.serveFile(w, r, f, stat, origName)
+		} else {
+			h.serveError(w, r, http.StatusInternalServerError)
+		}
+		return
+	}
+
+	ctype := mime.TypeByExtension(filepath.Ext(origName))
+	if ctype == "" {
+		ctype = http.DetectContentType(data)
+	}
+	e := &cacheEntry{
+		modTime: stat.ModTime(),
+		etag:    etagFor(stat),
+		ctype:   ctype,
+		data:    data,
+	}
+	h.cache.put(origName, e)
+	h.serveContent(w, r, bytes.NewReader(data), int64(len(data)), e.modTime, e.etag, e.ctype)
+}
+
+// etagFor builds the `"<hexmod>-<hexsize>"` validator without fmt/reflection.
+func etagFor(stat os.FileInfo) string {
+	buf := make([]byte, 0, 32)
+	buf = append(buf, '"')
+	buf = strconv.AppendInt(buf, stat.ModTime().Unix(), 16)
+	buf = append(buf, '-')
+	buf = strconv.AppendInt(buf, stat.Size(), 16)
+	buf = append(buf, '"')
+	return string(buf)
 }
 
 func (h *Handler) serveFile(w http.ResponseWriter, r *http.Request, f *os.File, stat os.FileInfo, origName string) {
-	etag := fmt.Sprintf(`"%x-%x"`, stat.ModTime().Unix(), stat.Size())
-	lastMod := stat.ModTime().UTC().Format(http.TimeFormat)
+	h.serveContent(w, r, f, stat.Size(), stat.ModTime(), etagFor(stat), mime.TypeByExtension(filepath.Ext(origName)))
+}
+
+// serveContent writes a response from any seekable source (an *os.File for the
+// streaming path, a *bytes.Reader for the in-memory cache), handling
+// conditional requests, byte ranges and the standard header set. A *os.File
+// source still benefits from sendfile via the ResponseWriter's ReaderFrom.
+func (h *Handler) serveContent(w http.ResponseWriter, r *http.Request, src io.ReadSeeker, size int64, modTime time.Time, etag, ctype string) {
+	lastMod := modTime.UTC().Format(http.TimeFormat)
 
 	if match := r.Header.Get("If-None-Match"); match != "" {
 		if match == etag || match == "*" {
@@ -159,7 +242,7 @@ func (h *Handler) serveFile(w http.ResponseWriter, r *http.Request, f *os.File, 
 	}
 	if ims := r.Header.Get("If-Modified-Since"); ims != "" {
 		t, err := time.Parse(http.TimeFormat, ims)
-		if err == nil && !stat.ModTime().After(t) {
+		if err == nil && !modTime.After(t) {
 			hdr := w.Header()
 			hdr["Etag"] = []string{etag}
 			hdr["Last-Modified"] = []string{lastMod}
@@ -171,24 +254,23 @@ func (h *Handler) serveFile(w http.ResponseWriter, r *http.Request, f *os.File, 
 		}
 	}
 
-	ctype := mime.TypeByExtension(filepath.Ext(origName))
 	if ctype == "" {
 		bufp := sniffPool.Get().(*[]byte)
-		n, _ := f.Read(*bufp)
+		n, _ := src.Read(*bufp)
 		ctype = http.DetectContentType((*bufp)[:n])
-		f.Seek(0, io.SeekStart)
+		src.Seek(0, io.SeekStart)
 		sniffPool.Put(bufp)
 	}
 
 	if rangeHdr := r.Header.Get("Range"); rangeHdr != "" && strings.HasPrefix(rangeHdr, "bytes=") {
-		if h.serveRange(w, r, f, stat, ctype, etag, lastMod) {
+		if h.serveRange(w, r, src, size, ctype, etag, lastMod) {
 			return
 		}
 	}
 
 	hdr := w.Header()
 	hdr["Content-Type"] = []string{ctype}
-	hdr["Content-Length"] = []string{strconv.FormatInt(stat.Size(), 10)}
+	hdr["Content-Length"] = []string{strconv.FormatInt(size, 10)}
 	hdr["Etag"] = []string{etag}
 	hdr["Last-Modified"] = []string{lastMod}
 	hdr["Accept-Ranges"] = []string{"bytes"}
@@ -206,39 +288,47 @@ func (h *Handler) serveFile(w http.ResponseWriter, r *http.Request, f *os.File, 
 	}
 
 	w.WriteHeader(http.StatusOK)
-	if rf, ok := w.(io.ReaderFrom); ok {
-		rf.ReadFrom(f)
-	} else {
-		f.WriteTo(w)
-	}
+	writeBody(w, src)
 }
 
-func (h *Handler) serveRange(w http.ResponseWriter, r *http.Request, f *os.File, stat os.FileInfo, ctype, etag, lastMod string) bool {
+func writeBody(w http.ResponseWriter, src io.ReadSeeker) {
+	if f, ok := src.(*os.File); ok {
+		if rf, ok := w.(io.ReaderFrom); ok {
+			rf.ReadFrom(f)
+			return
+		}
+	}
+	if wt, ok := src.(io.WriterTo); ok {
+		wt.WriteTo(w)
+		return
+	}
+	io.Copy(w, src)
+}
+
+func (h *Handler) serveRange(w http.ResponseWriter, r *http.Request, src io.ReadSeeker, size int64, ctype, etag, lastMod string) bool {
 	s := r.Header.Get("Range")
 	s = strings.TrimPrefix(s, "bytes=")
 
-	ranges, err := parseRange(s, stat.Size())
+	ranges, err := parseRange(s, size)
 	if err != nil || len(ranges) == 0 {
-		hdr := w.Header()
-		hdr["Content-Range"] = []string{fmt.Sprintf("bytes */%d", stat.Size())}
+		w.Header()["Content-Range"] = []string{unsatisfiedRange(size)}
 		w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
 		return true
 	}
 
 	ra := ranges[0]
-	if ra.end >= stat.Size() {
-		ra.end = stat.Size() - 1
+	if ra.end >= size {
+		ra.end = size - 1
 	}
-	if ra.start >= stat.Size() || ra.start > ra.end {
-		hdr := w.Header()
-		hdr["Content-Range"] = []string{fmt.Sprintf("bytes */%d", stat.Size())}
+	if ra.start >= size || ra.start > ra.end {
+		w.Header()["Content-Range"] = []string{unsatisfiedRange(size)}
 		w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
 		return true
 	}
 
 	hdr := w.Header()
 	hdr["Content-Type"] = []string{ctype}
-	hdr["Content-Range"] = []string{fmt.Sprintf("bytes %d-%d/%d", ra.start, ra.end, stat.Size())}
+	hdr["Content-Range"] = []string{contentRange(ra.start, ra.end, size)}
 	hdr["Content-Length"] = []string{strconv.FormatInt(ra.length(), 10)}
 	hdr["Etag"] = []string{etag}
 	hdr["Last-Modified"] = []string{lastMod}
@@ -251,9 +341,27 @@ func (h *Handler) serveRange(w http.ResponseWriter, r *http.Request, f *os.File,
 	}
 
 	w.WriteHeader(http.StatusPartialContent)
-	f.Seek(ra.start, io.SeekStart)
-	io.CopyN(w, f, ra.length())
+	src.Seek(ra.start, io.SeekStart)
+	io.CopyN(w, src, ra.length())
 	return true
+}
+
+func unsatisfiedRange(size int64) string {
+	buf := make([]byte, 0, 16)
+	buf = append(buf, "bytes */"...)
+	buf = strconv.AppendInt(buf, size, 10)
+	return string(buf)
+}
+
+func contentRange(start, end, size int64) string {
+	buf := make([]byte, 0, 32)
+	buf = append(buf, "bytes "...)
+	buf = strconv.AppendInt(buf, start, 10)
+	buf = append(buf, '-')
+	buf = strconv.AppendInt(buf, end, 10)
+	buf = append(buf, '/')
+	buf = strconv.AppendInt(buf, size, 10)
+	return string(buf)
 }
 
 type byteRange struct {
@@ -386,6 +494,70 @@ type gzipFile struct {
 	f    *os.File
 	stat os.FileInfo
 	orig string
+}
+
+// cacheEntry is a fully resolved small file held in memory by the optional
+// static cache: its bytes plus everything serveContent needs to emit headers.
+type cacheEntry struct {
+	modTime time.Time
+	etag    string
+	ctype   string
+	data    []byte
+}
+
+// maxCacheEntries bounds the number of distinct files held in memory.
+const maxCacheEntries = 4096
+
+type cacheItem struct {
+	entry   *cacheEntry
+	expires time.Time
+}
+
+// fileCache is a bounded, TTL'd map of filesystem path -> resolved file. Within
+// the TTL a hit serves entirely from memory, skipping the open/stat/read
+// syscalls. It deliberately does not revalidate against disk before expiry, so
+// the configured static_cache_ttl bounds how stale a served file can be —
+// mirroring nginx's open_file_cache trade-off.
+type fileCache struct {
+	mu      sync.RWMutex
+	entries map[string]cacheItem
+	ttl     time.Duration
+}
+
+func newFileCache(ttl time.Duration) *fileCache {
+	return &fileCache{entries: make(map[string]cacheItem), ttl: ttl}
+}
+
+func (c *fileCache) get(key string) (*cacheEntry, bool) {
+	c.mu.RLock()
+	it, ok := c.entries[key]
+	c.mu.RUnlock()
+	if !ok {
+		return nil, false
+	}
+	if time.Now().After(it.expires) {
+		c.mu.Lock()
+		if cur, ok := c.entries[key]; ok && time.Now().After(cur.expires) {
+			delete(c.entries, key)
+		}
+		c.mu.Unlock()
+		return nil, false
+	}
+	return it.entry, true
+}
+
+func (c *fileCache) put(key string, e *cacheEntry) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.entries) >= maxCacheEntries {
+		if _, exists := c.entries[key]; !exists {
+			for k := range c.entries {
+				delete(c.entries, k)
+				break
+			}
+		}
+	}
+	c.entries[key] = cacheItem{entry: e, expires: time.Now().Add(c.ttl)}
 }
 
 func precompressedGzip(r *http.Request, target string) (*gzipFile, bool) {

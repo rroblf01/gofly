@@ -171,7 +171,7 @@ gofly uses a single JSON config file. Default path: `/etc/gofly/config.json` (ov
 #### Global config
 
 | Field | Type | Default | Description |
-|---|---|---|---|---|
+|---|---|---|---|
 | `port` | int | `80` | HTTP listen port |
 | `workers` | int | `1` | Number of SO_REUSEPORT accept goroutines (Linux only) |
 | `access_log` | bool | `true` | Enable/disable access log (disable for maximum throughput) |
@@ -179,9 +179,12 @@ gofly uses a single JSON config file. Default path: `/etc/gofly/config.json` (ov
 | `write_timeout` | string | `"30s"` | Max duration for writing response |
 | `idle_timeout` | string | `"120s"` | Max duration for idle connections |
 | `max_body_size` | int | `0` (unlimited) | Max request body size in bytes |
+| `memory_limit` | int | `104857600` (100 MB) | Soft heap limit in bytes (`debug.SetMemoryLimit`) |
+| `gogc` | int | — | `GOGC` percent (`debug.SetGCPercent`); higher = fewer GC cycles, more RAM |
 | `rate_limit` | object | — | Global rate limiting config |
 | `rate_limit.requests_per_second` | float | — | Requests per second per IP |
 | `rate_limit.burst` | int | — | Burst capacity |
+| `rate_limit.idle_ttl` | string | `"10m"` | Evict a per-IP bucket after this idle time (bounds rate-limiter memory) |
 | `tls` | object | — | TLS configuration |
 
 #### Route config
@@ -193,8 +196,12 @@ gofly uses a single JSON config file. Default path: `/etc/gofly/config.json` (ov
 | `upstreams` | []string | — | Backend URLs for reverse proxy |
 | `strategy` | string | `"round_robin"` | Load balancing strategy |
 | `static_dir` | string | — | Directory to serve static files from |
+| `static_cache_ttl` | string | — | Cache small files (≤1 MiB) in memory for this TTL, skipping open/stat/read syscalls. Takes precedence over `precompressed`. |
+| `precompressed` | bool | `true` | Probe for a sibling `.gz` file when the client accepts gzip. Set `false` to skip the stat syscall on routes without pre-compressed assets. |
 | `browser_cache_ttl` | string | — | Cache-Control max-age (e.g. `"3600s"`) |
 | `gzip` | bool | `false` | Enable gzip compression |
+| `gzip_level` | int | `-1` (default) | gzip compression level `[-2,9]` (`1`=fastest, `9`=best, `-1`=default) |
+| `gzip_min_length` | int | `0` | Minimum response size in bytes before compressing (0 = always) |
 | `set_headers` | object | — | Headers to inject into upstream requests (supports `$remote_addr`, `$host`, `$scheme`, `$uri`, `$request_uri`) |
 | `remove_headers` | []string | — | Headers to strip from upstream requests |
 | `host` | string | — | Override the Host header |
@@ -330,55 +337,74 @@ docker compose --profile example up -d
 
 ### Load test (wrk — 100 concurrent connections, 4 threads, 15s)
 
-Same static page (`www/index.html`, ~800 B), same hardware (AMD Ryzen 5 3600, 12 cores).
+Same static page (`www/index.html`, 672 B), same machine for every row
+(AMD Ryzen 7 5700U, 16 threads). nginx runs in Docker with `--network host`,
+`worker_processes auto`, `access_log off`, `sendfile on`.
 
 | Config | Requests/s | Latency (avg) | Memory (RSS) |
 |---|---|---|---|
-| gofly (1 worker, access_log off) | 108,566 | 1.12 ms | ~21 MB |
-| gofly (SO_REUSEPORT ×12, access_log off) | 114,185 | 1.07 ms | ~21 MB |
-| gofly (SO_REUSEPORT ×12, access_log off, GOGC=off, GOMEMLIMIT=200MiB) | **127,051** | **0.88 ms** | **~190 MB** |
-| **nginx alpine** (`worker_processes auto`, access_log off) | **136,930** | **0.85 ms** | **~10 MB** |
+| gofly (1 worker, access_log off) | 88,053 | 1.26 ms | ~22 MB |
+| gofly (SO_REUSEPORT ×16, access_log off) | 92,440 | 1.22 ms | ~22 MB |
+| gofly (×16, GOGC=off, GOMEMLIMIT=200MiB) | 105,691 | 0.91 ms | ~92 MB |
+| gofly (×16, **static_cache_ttl**, default GC) | 148,502 | 0.72 ms | **~22 MB** |
+| gofly (×16, **static_cache_ttl**, GOGC=off, GOMEMLIMIT=200MiB) | **192,872** | **0.43 ms** | ~96 MB |
+| **nginx alpine** (`worker_processes auto`) | **201,084** | 0.46 ms | ~77 MB (17 procs) |
 
-gofly reaches **93% of nginx throughput** with **zero external dependencies**, a **5× smaller Docker image**, and **memory-safe Go**.
+The in-memory static cache (`static_cache_ttl`) is the headline change: it skips
+the per-request `open`/`stat`/`read` syscalls and serves small files straight
+from memory, lifting gofly from ~53% to **96% of nginx throughput** with **lower
+average latency** (0.43 ms vs 0.46 ms). With the default GC it delivers **74% of
+nginx throughput at ~22 MB RSS** — under a third of nginx's footprint.
 
 ### Comparison with nginx
 
+Best gofly config (×16 workers, `static_cache_ttl`, GOGC=off + GOMEMLIMIT=200MiB) vs nginx alpine:
+
 | Metric | gofly (scratch) | nginx (alpine) | Difference |
 |---|---|---|---|
-| **Requests/sec** | 127,051 | 136,930 | -7% |
-| **Latency (avg)** | 0.88 ms | 0.85 ms | +3% |
+| **Requests/sec** | 192,872 | 201,084 | -4% |
+| **Latency (avg)** | **0.43 ms** | 0.46 ms | **-7%** 🏆 |
 | **Image size** | **~7 MB** | ~35 MB | **5× smaller** 🏆 |
 | **Dependencies** | **0** (pure stdlib) | libc, PCRE, zlib, OpenSSL | **—** 🏆 |
 | **Static binary** | ✅ Yes | ❌ No | **—** 🏆 |
 | **Memory safety** | ✅ Yes (Go) | ❌ No (C) | **—** 🏆 |
 | **Configuration** | **JSON (simple)** | nginx.conf | **—** 🏆 |
 
-> gofly delivers **93% of nginx throughput** while being **5× smaller**, **zero dependencies**, and **memory-safe by construction**.
+> With the static cache enabled, gofly delivers **96% of nginx throughput at
+> lower average latency**, while being **5× smaller**, **zero dependencies**, and
+> **memory-safe by construction**.
 
 ### Memory usage
 
 | State | gofly (default GC) | gofly (GOGC=off, GOMEMLIMIT=200MiB) |
 |---|---|---|
 | Idle (no traffic) | ~10 MB | ~10 MB |
-| After sustained load | ~21 MB | ~190 MB |
+| Sustained load, no cache | ~22 MB | ~92 MB |
+| Sustained load, static cache | ~22 MB | ~96 MB |
 
-> `GOMEMLIMIT` caps Go's heap and triggers GC only when needed. Without it, `GOGC=off` lets the heap grow unbounded.
+> The static cache is bounded: up to 4096 entries, files ≤1 MiB each, evicted
+> after `static_cache_ttl`. `GOMEMLIMIT` caps Go's heap and triggers GC only when
+> needed; without it, `GOGC=off` lets the heap grow unbounded.
 
 ### Architecture and optimizations
 
 gofly achieves its performance through:
 
+- **In-memory static cache** — optional `static_cache_ttl` holds resolved small files (≤1 MiB, ≤4096 entries) in memory, skipping `open`/`stat`/`read` syscalls on hits and serving straight from a `bytes.Reader`. Conditional requests and byte ranges are honored from the cached copy.
 - **sendfile(2) zero-copy** — `w.(io.ReaderFrom).ReadFrom(f)` delegates directly to Go's `net.TCPConn.ReadFrom`, which uses `sendfile(2)` on Linux when the source is a regular file. No userspace buffer copy.
 - **SO_REUSEPORT** — multiple goroutines accept on separate sockets, kernel distributes connections across them. Configurable via `workers`.
+- **Pooled gzip writers** — `sync.Pool` per compression level reuses the ~256 KiB compressor window instead of reallocating it per response; optional `gzip_min_length` skips compressing tiny payloads.
+- **Tuned upstream transport** — 256 idle keepalive conns/host (up from 10), `ForceAttemptHTTP2`, and 64 KiB read/write buffers cut connection churn under proxy load.
+- **Sharded rate limiter** — per-IP buckets are spread across 256 independently-locked shards; a background janitor evicts idle buckets (`rate_limit.idle_ttl`) so memory stays bounded.
 - **Async logging** — log entries go to a buffered channel (16384 capacity), background goroutine drains it. `access_log: false` bypasses the wrapper entirely (zero cost).
-- **Pooled response writer** — `sync.Pool` reuses `responseWriter` structs across requests.
+- **Pooled response writer** — `sync.Pool` reuses `responseWriter` structs across requests; WebSocket relays reuse pooled 32 KiB buffers.
 - **Sniff buffer pool** — 512-byte `sync.Pool` for `http.DetectContentType` fallback.
 - **Direct header map** — `h["Content-Type"] = []string{ctype}` avoids `Header().Set()` overhead.
-- **Pre-compiled Cache-Control** — string concatenation at init time, no `fmt.Sprintf` on hot path.
+- **Allocation-free hot path** — ETag and `Content-Range` are built with `strconv.AppendInt`, and the static root is resolved to an absolute path once at startup (no per-request `filepath.Abs`/`os.Getwd`).
 - **Pre-built ReverseProxy** — created once in `New()`, not per-request.
 - **Atomic round-robin** — `atomic.Uint64`, no locks.
 - **Tuned TCP** — `TCP_DEFER_ACCEPT` + `TCP_QUICKACK` on listener socket (Linux).
-- **GC control** — pair `GOGC=off` with `GOMEMLIMIT` for near-zero GC overhead with bounded memory.
+- **GC control** — set `gogc` (or pair `GOGC=off` with `GOMEMLIMIT`) for near-zero GC overhead with bounded memory.
 
 ### Production tuning
 
@@ -415,19 +441,22 @@ git push origin v0.1.0
 # Create the release on GitHub → workflow publishes the image
 ```
 
-### Go benchmarks (internal, per-core)
+### Go benchmarks (internal)
 
-| Benchmark | Ops | Latency | Allocs/op | Bytes/op |
-|---|---|---|---|---|---|
-| Reverse proxy (single upstream) | 14,911 | 81.6 µs | 168 | 54,991 |
-| Reverse proxy (3 upstreams, round-robin) | 14,486 | 82.1 µs | 167 | 55,274 |
-| Static file (small, 13 B) | 35,677 | 34.0 µs | 118 | 15,098 |
-| Static file (large, 256 KB) | 20,604 | 54.8 µs | 120 | 17,349 |
-| Proxy throughput (sequential) | 8,442 | 136.0 µs | 150 | 46,161 |
-| Real-world page (HTML+CSS+JS) | 13,670 | 86.5 µs | 102 | 8,319 |
-| **Heap alloc per request** | **8,606** | **135.4 µs** | **10.55 B/req** | **46,121** |
+Full client→server→loopback round trips via `httptest`, AMD Ryzen 7 5700U
+(16 threads), `go test -bench=. -benchmem -benchtime=2s`.
 
-> Note: Parallel benchmarks use `RunParallel` and auto-scale to GOMAXPROCS (12 cores).
+| Benchmark | Latency | Allocs/op | Bytes/op |
+|---|---|---|---|
+| Reverse proxy (single upstream) | 77.4 µs | 168 | 53,647 |
+| Reverse proxy (3 upstreams, round-robin) | 71.6 µs | 167 | 53,297 |
+| Static file (small, 13 B) | 57.6 µs | 122 | 20,684 |
+| Static file (large, 256 KB) | 131.5 µs | 114 | 21,931 |
+| Proxy throughput (sequential) | 352.8 µs | 149 | 46,334 |
+| Real-world page (HTML+CSS+JS) | 238.0 µs | 100 | 8,336 |
+| **Heap alloc per request** | — | — | **42.7 B/req** |
+
+> Note: Parallel benchmarks use `RunParallel` and auto-scale to GOMAXPROCS (16 threads).
 
 ## Architecture
 

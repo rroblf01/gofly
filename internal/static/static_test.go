@@ -921,6 +921,116 @@ func TestStatic_GzipPrecompressed(t *testing.T) {
 	}
 }
 
+func TestStatic_CacheServesFromMemory(t *testing.T) {
+	logger.Init()
+
+	dir := t.TempDir()
+	if err := os.WriteFile(dir+"/cached.txt", []byte("v1"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	ttl := config.Duration{Duration: time.Hour}
+	h := New(config.Route{Path: "/", StaticDir: dir, StaticCacheTTL: &ttl})
+
+	// First request populates the cache.
+	resp := httptest.NewRecorder()
+	h.ServeHTTP(resp, httptest.NewRequest("GET", "/cached.txt", nil))
+	if body, _ := io.ReadAll(resp.Body); string(body) != "v1" {
+		t.Fatalf("first body = %q, want %q", body, "v1")
+	}
+
+	// Remove the file from disk; a cache hit must still serve the bytes.
+	if err := os.Remove(dir + "/cached.txt"); err != nil {
+		t.Fatal(err)
+	}
+
+	resp2 := httptest.NewRecorder()
+	h.ServeHTTP(resp2, httptest.NewRequest("GET", "/cached.txt", nil))
+	if resp2.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d (should hit cache)", resp2.Code, http.StatusOK)
+	}
+	if body, _ := io.ReadAll(resp2.Body); string(body) != "v1" {
+		t.Errorf("cached body = %q, want %q", body, "v1")
+	}
+}
+
+func TestStatic_CacheHonorsConditional(t *testing.T) {
+	logger.Init()
+
+	dir := t.TempDir()
+	if err := os.WriteFile(dir+"/c.txt", []byte("cached"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	ttl := config.Duration{Duration: time.Hour}
+	h := New(config.Route{Path: "/", StaticDir: dir, StaticCacheTTL: &ttl})
+
+	warm := httptest.NewRecorder()
+	h.ServeHTTP(warm, httptest.NewRequest("GET", "/c.txt", nil))
+	etag := warm.Header().Get("ETag")
+	if etag == "" {
+		t.Fatal("ETag not set")
+	}
+
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/c.txt", nil)
+	req.Header.Set("If-None-Match", etag)
+	h.ServeHTTP(resp, req)
+	if resp.Code != http.StatusNotModified {
+		t.Errorf("status = %d, want %d (cached entry should honor If-None-Match)", resp.Code, http.StatusNotModified)
+	}
+}
+
+func TestStatic_CacheRange(t *testing.T) {
+	logger.Init()
+
+	dir := t.TempDir()
+	if err := os.WriteFile(dir+"/r.txt", []byte("0123456789abcdef"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	ttl := config.Duration{Duration: time.Hour}
+	h := New(config.Route{Path: "/", StaticDir: dir, StaticCacheTTL: &ttl})
+
+	// Warm the cache, then request a range from the in-memory copy.
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/r.txt", nil))
+
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/r.txt", nil)
+	req.Header.Set("Range", "bytes=5-9")
+	h.ServeHTTP(resp, req)
+	if resp.Code != http.StatusPartialContent {
+		t.Errorf("status = %d, want %d", resp.Code, http.StatusPartialContent)
+	}
+	if body, _ := io.ReadAll(resp.Body); string(body) != "56789" {
+		t.Errorf("range body = %q, want %q", body, "56789")
+	}
+}
+
+func TestStatic_PrecompressedDisabled(t *testing.T) {
+	logger.Init()
+
+	dir := t.TempDir()
+	if err := os.WriteFile(dir+"/test.txt", []byte("original"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dir+"/test.txt.gz", []byte("gzipped"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	off := false
+	h := New(config.Route{Path: "/", StaticDir: dir, Precompressed: &off})
+
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/test.txt", nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+	h.ServeHTTP(resp, req)
+
+	if body, _ := io.ReadAll(resp.Body); string(body) != "original" {
+		t.Errorf("body = %q, want %q (precompressed disabled should serve identity)", body, "original")
+	}
+}
+
 func TestStatic_GzipNotAccepted(t *testing.T) {
 	logger.Init()
 

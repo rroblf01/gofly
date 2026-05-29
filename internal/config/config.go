@@ -20,12 +20,14 @@ type Config struct {
 	TLS          *TLSConfig `json:"tls,omitempty"`
 	AccessLog    *bool      `json:"access_log,omitempty"`
 	MemoryLimit  int64      `json:"memory_limit,omitempty"`
+	GOGC         int        `json:"gogc,omitempty"`
 	Routes       []Route    `json:"routes"`
 }
 
 type RateLimit struct {
-	RequestsPerSecond float64 `json:"requests_per_second"`
-	Burst             int     `json:"burst"`
+	RequestsPerSecond float64   `json:"requests_per_second"`
+	Burst             int       `json:"burst"`
+	IdleTTL           *Duration `json:"idle_ttl,omitempty"`
 }
 
 type TLSConfig struct {
@@ -36,26 +38,30 @@ type TLSConfig struct {
 }
 
 type Route struct {
-	Path          string            `json:"path"`
-	Host          string            `json:"host,omitempty"`
-	ServerName    string            `json:"server_name,omitempty"`
-	Upstreams     []string          `json:"upstreams,omitempty"`
-	Strategy      string            `json:"strategy,omitempty"`
-	SetHeaders    map[string]string `json:"set_headers,omitempty"`
-	RemoveHeaders []string          `json:"remove_headers,omitempty"`
-	StaticDir     string            `json:"static_dir,omitempty"`
-	BrowserCacheTTL *Duration       `json:"browser_cache_ttl,omitempty"`
-	Rewrite       string            `json:"rewrite,omitempty"`
-	UpstreamTimeout *Duration       `json:"upstream_timeout,omitempty"`
-	RetryOnError  bool              `json:"retry_on_error,omitempty"`
-	MaxBodySize   int64             `json:"max_body_size,omitempty"`
-	MaxFails      int               `json:"max_fails,omitempty"`
-	FailTimeout   *Duration         `json:"fail_timeout,omitempty"`
-	Gzip          *bool             `json:"gzip,omitempty"`
-	SPA           bool              `json:"spa,omitempty"`
-	AutoIndex     bool              `json:"autoindex,omitempty"`
-	ErrorPages    map[int]string    `json:"error_pages,omitempty"`
-	SecurityHeaders *bool           `json:"security_headers,omitempty"`
+	Path            string            `json:"path"`
+	Host            string            `json:"host,omitempty"`
+	ServerName      string            `json:"server_name,omitempty"`
+	Upstreams       []string          `json:"upstreams,omitempty"`
+	Strategy        string            `json:"strategy,omitempty"`
+	SetHeaders      map[string]string `json:"set_headers,omitempty"`
+	RemoveHeaders   []string          `json:"remove_headers,omitempty"`
+	StaticDir       string            `json:"static_dir,omitempty"`
+	BrowserCacheTTL *Duration         `json:"browser_cache_ttl,omitempty"`
+	Rewrite         string            `json:"rewrite,omitempty"`
+	UpstreamTimeout *Duration         `json:"upstream_timeout,omitempty"`
+	RetryOnError    bool              `json:"retry_on_error,omitempty"`
+	MaxBodySize     int64             `json:"max_body_size,omitempty"`
+	MaxFails        int               `json:"max_fails,omitempty"`
+	FailTimeout     *Duration         `json:"fail_timeout,omitempty"`
+	Gzip            *bool             `json:"gzip,omitempty"`
+	GzipLevel       *int              `json:"gzip_level,omitempty"`
+	GzipMinLength   int               `json:"gzip_min_length,omitempty"`
+	SPA             bool              `json:"spa,omitempty"`
+	AutoIndex       bool              `json:"autoindex,omitempty"`
+	ErrorPages      map[int]string    `json:"error_pages,omitempty"`
+	SecurityHeaders *bool             `json:"security_headers,omitempty"`
+	StaticCacheTTL  *Duration         `json:"static_cache_ttl,omitempty"`
+	Precompressed   *bool             `json:"precompressed,omitempty"`
 }
 
 type Duration struct {
@@ -173,6 +179,15 @@ func (c *Config) validate() error {
 		if r.MaxFails < 0 {
 			return fmt.Errorf("routes[%d].max_fails must be non-negative", i)
 		}
+		if r.GzipLevel != nil && (*r.GzipLevel < -2 || *r.GzipLevel > 9) {
+			return fmt.Errorf("routes[%d].gzip_level %d out of range [-2,9]", i, *r.GzipLevel)
+		}
+		if r.GzipMinLength < 0 {
+			return fmt.Errorf("routes[%d].gzip_min_length must be non-negative", i)
+		}
+		if r.StaticCacheTTL != nil && r.StaticCacheTTL.Duration < 0 {
+			return fmt.Errorf("routes[%d].static_cache_ttl must be non-negative", i)
+		}
 	}
 	return nil
 }
@@ -206,4 +221,21 @@ func (r *Route) EffectiveMaxBodySize(defaultSize int64) int64 {
 
 func (r *Route) SecurityHeadersDefault() bool {
 	return r.SecurityHeaders == nil || *r.SecurityHeaders
+}
+
+// PrecompressedEnabled reports whether the handler should probe for a sibling
+// .gz file. Defaults to true to preserve historical behaviour; set it to false
+// to skip the extra stat syscall on routes that never ship pre-compressed
+// assets.
+func (r *Route) PrecompressedEnabled() bool {
+	return r.Precompressed == nil || *r.Precompressed
+}
+
+// GzipCompressionLevel returns the configured gzip level, or -1
+// (gzip.DefaultCompression) when unset.
+func (r *Route) GzipCompressionLevel() int {
+	if r.GzipLevel != nil {
+		return *r.GzipLevel
+	}
+	return -1
 }

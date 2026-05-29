@@ -37,11 +37,11 @@ type Server struct {
 	configPath string
 	http       *http.Server
 	mux        *http.ServeMux
-	rateLimits map[string]*tokenBucket
-	rlMu       sync.RWMutex
+	rl         atomic.Pointer[rateLimiter]
 	logCh      chan logEntry
 	logWg      sync.WaitGroup
 	stopLog    chan struct{}
+	stopRL     chan struct{}
 	listeners  []net.Listener
 	sh         *swappableHandler
 }
@@ -91,21 +91,91 @@ func (tb *tokenBucket) allow() bool {
 	return false
 }
 
+// rlShards is the number of independently-locked partitions of the per-IP
+// bucket map. Sharding keeps the rate limiter from serialising every request
+// through one mutex under load.
+const rlShards = 256
+
+// rlDefaultIdleTTL is how long a per-IP bucket may sit idle before the janitor
+// evicts it, bounding memory against a wide or spoofed client base.
+const rlDefaultIdleTTL = 10 * time.Minute
+
+type rlShard struct {
+	mu      sync.Mutex
+	buckets map[string]*tokenBucket
+}
+
+type rateLimiter struct {
+	shards [rlShards]rlShard
+	rate   float64
+	burst  int
+	ttl    time.Duration
+}
+
+func newRateLimiter(rate float64, burst int, ttl time.Duration) *rateLimiter {
+	rl := &rateLimiter{rate: rate, burst: burst, ttl: ttl}
+	for i := range rl.shards {
+		rl.shards[i].buckets = make(map[string]*tokenBucket)
+	}
+	return rl
+}
+
+func (rl *rateLimiter) shardFor(ip string) *rlShard {
+	// FNV-1a over the IP string.
+	var h uint32 = 2166136261
+	for i := 0; i < len(ip); i++ {
+		h ^= uint32(ip[i])
+		h *= 16777619
+	}
+	return &rl.shards[h%rlShards]
+}
+
+func (rl *rateLimiter) allow(ip string) bool {
+	s := rl.shardFor(ip)
+	s.mu.Lock()
+	b, ok := s.buckets[ip]
+	if !ok {
+		b = newTokenBucket(rl.rate, rl.burst)
+		s.buckets[ip] = b
+	}
+	s.mu.Unlock()
+	return b.allow()
+}
+
+// sweep evicts buckets whose last activity predates the idle TTL.
+func (rl *rateLimiter) sweep() {
+	cutoff := time.Now().Add(-rl.ttl)
+	for i := range rl.shards {
+		s := &rl.shards[i]
+		s.mu.Lock()
+		for ip, b := range s.buckets {
+			b.mu.Lock()
+			idle := b.lastRefill.Before(cutoff)
+			b.mu.Unlock()
+			if idle {
+				delete(s.buckets, ip)
+			}
+		}
+		s.mu.Unlock()
+	}
+}
+
 func New(cfg config.Config) *Server {
 	mux := http.NewServeMux()
 
 	s := &Server{
-		cfg:        cfg,
-		mux:        mux,
-		rateLimits: make(map[string]*tokenBucket),
-		logCh:      make(chan logEntry, 16384),
-		stopLog:    make(chan struct{}),
+		cfg:     cfg,
+		mux:     mux,
+		logCh:   make(chan logEntry, 16384),
+		stopLog: make(chan struct{}),
+		stopRL:  make(chan struct{}),
 	}
 
 	s.registerRoutes()
 	s.startLogWorker()
 
 	handler := s.buildMiddleware(mux)
+	s.startRateLimitJanitor()
 
 	s.http = &http.Server{
 		Addr:         fmt.Sprintf(":%d", cfg.Port),
@@ -118,13 +188,23 @@ func New(cfg config.Config) *Server {
 	return s
 }
 
+func (s *Server) newRateLimiterFromCfg() *rateLimiter {
+	ttl := rlDefaultIdleTTL
+	if s.cfg.RateLimit.IdleTTL != nil && s.cfg.RateLimit.IdleTTL.Duration > 0 {
+		ttl = s.cfg.RateLimit.IdleTTL.Duration
+	}
+	return newRateLimiter(s.cfg.RateLimit.RequestsPerSecond, s.cfg.RateLimit.Burst, ttl)
+}
+
 func (s *Server) buildMiddleware(mux *http.ServeMux) http.Handler {
 	sh := &swappableHandler{}
 	s.sh = sh
 	var handler http.Handler = mux
 	handler = s.middleware(handler)
 	if s.cfg.RateLimit != nil {
-		handler = s.rateLimitMiddleware(handler)
+		rl := s.newRateLimiterFromCfg()
+		s.rl.Store(rl)
+		handler = s.rateLimitMiddleware(rl, handler)
 	}
 	sh.Swap(handler)
 	return sh
@@ -138,11 +218,43 @@ func (s *Server) rebuildHandler() {
 	handler := http.Handler(mux)
 	handler = s.middleware(handler)
 	if s.cfg.RateLimit != nil {
-		s.rateLimits = make(map[string]*tokenBucket)
-		handler = s.rateLimitMiddleware(handler)
+		rl := s.newRateLimiterFromCfg()
+		s.rl.Store(rl)
+		handler = s.rateLimitMiddleware(rl, handler)
+	} else {
+		s.rl.Store(nil)
 	}
 
 	s.sh.Swap(handler)
+}
+
+// startRateLimitJanitor periodically evicts idle per-IP buckets so the rate
+// limiter's memory stays bounded. It is a no-op when rate limiting is off.
+func (s *Server) startRateLimitJanitor() {
+	rl := s.rl.Load()
+	if rl == nil {
+		return
+	}
+	interval := rl.ttl / 2
+	if interval < time.Minute {
+		interval = time.Minute
+	}
+	s.logWg.Add(1)
+	go func() {
+		defer s.logWg.Done()
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		for {
+			select {
+			case <-t.C:
+				if cur := s.rl.Load(); cur != nil {
+					cur.sweep()
+				}
+			case <-s.stopRL:
+				return
+			}
+		}
+	}()
 }
 
 func (s *Server) registerRoutes() {
@@ -152,7 +264,7 @@ func (s *Server) registerRoutes() {
 		case route.StaticDir != "":
 			var h http.Handler = static.New(route)
 			if gzipEnabled(route) {
-				h = gzipMiddleware(h)
+				h = gzipMiddlewareWith(h, route.GzipCompressionLevel(), route.GzipMinLength)
 			}
 			if route.ServerName != "" {
 				s.mux.HandleFunc(route.Path, s.hostHandler(route.ServerName, h))
@@ -177,7 +289,7 @@ func (s *Server) registerRoutes() {
 			}
 			var h http.Handler = p
 			if gzipEnabled(route) {
-				h = gzipMiddleware(h)
+				h = gzipMiddlewareWith(h, route.GzipCompressionLevel(), route.GzipMinLength)
 			}
 			if route.ServerName != "" {
 				s.mux.HandleFunc(route.Path, s.hostHandler(route.ServerName, h))
@@ -216,40 +328,20 @@ func (s *Server) registerPattern(path string, handler http.Handler) {
 		return
 	}
 	s.mux.Handle(path, handler)
-	subtree := path
-	if subtree[len(subtree)-1] != '/' {
-		subtree += "/"
+	// Register the subtree variant too, but only when path doesn't already end
+	// in "/" — otherwise ServeMux panics on the duplicate pattern.
+	if path[len(path)-1] != '/' {
+		s.mux.Handle(path+"/", handler)
 	}
-	s.mux.Handle(subtree, handler)
 }
 
-func (s *Server) rateLimitMiddleware(next http.Handler) http.Handler {
+func (s *Server) rateLimitMiddleware(rl *rateLimiter, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ip := extractIP(r)
-
-		s.rlMu.RLock()
-		bucket, exists := s.rateLimits[ip]
-		s.rlMu.RUnlock()
-
-		if !exists {
-			s.rlMu.Lock()
-			bucket, exists = s.rateLimits[ip]
-			if !exists {
-				bucket = newTokenBucket(
-					s.cfg.RateLimit.RequestsPerSecond,
-					s.cfg.RateLimit.Burst,
-				)
-				s.rateLimits[ip] = bucket
-			}
-			s.rlMu.Unlock()
-		}
-
-		if !bucket.allow() {
+		if !rl.allow(extractIP(r)) {
 			w.Header().Set("Retry-After", "1")
 			http.Error(w, "too many requests", http.StatusTooManyRequests)
 			return
 		}
-
 		next.ServeHTTP(w, r)
 	})
 }
@@ -351,6 +443,7 @@ func (s *Server) ListenAndServe() error {
 func (s *Server) Shutdown(ctx context.Context) error {
 	err := s.http.Shutdown(ctx)
 	close(s.stopLog)
+	close(s.stopRL)
 	s.logWg.Wait()
 	return err
 }
@@ -362,6 +455,11 @@ func Run(cfg config.Config, configPath string) error {
 		"limit_bytes": limit,
 		"limit_mb":    limit >> 20,
 	})
+
+	if cfg.GOGC > 0 {
+		debug.SetGCPercent(cfg.GOGC)
+		logger.Info("gc percent set", logger.LogFields{"gogc": cfg.GOGC})
+	}
 
 	srv := New(cfg)
 	srv.configPath = configPath
@@ -483,29 +581,135 @@ func gzipEnabled(route config.Route) bool {
 	return false
 }
 
+// gzipPools holds one sync.Pool of *gzip.Writer per compression level, since a
+// writer's level is fixed once created. Reusing writers avoids reallocating the
+// ~256 KiB compressor window on every gzipped response.
+var gzipPools sync.Map // int -> *sync.Pool
+
+func getGzipWriter(w io.Writer, level int) *gzip.Writer {
+	p, _ := gzipPools.LoadOrStore(level, &sync.Pool{})
+	if gw, ok := p.(*sync.Pool).Get().(*gzip.Writer); ok {
+		gw.Reset(w)
+		return gw
+	}
+	gw, err := gzip.NewWriterLevel(w, level)
+	if err != nil {
+		gw = gzip.NewWriter(w)
+	}
+	return gw
+}
+
+func putGzipWriter(level int, gw *gzip.Writer) {
+	if p, ok := gzipPools.Load(level); ok {
+		p.(*sync.Pool).Put(gw)
+	}
+}
+
+// gzipResponseWriter compresses responses lazily. With minLength == 0 it commits
+// to gzip on the first write (streaming, historical behaviour). With
+// minLength > 0 it buffers until the body crosses the threshold, sending small
+// responses uncompressed so tiny payloads aren't inflated.
 type gzipResponseWriter struct {
 	http.ResponseWriter
-	writer *gzip.Writer
+	level       int
+	minLength   int
+	status      int
+	buf         []byte
+	gw          *gzip.Writer
+	gzipOn      bool
+	wroteHeader bool
 }
 
-func (grw *gzipResponseWriter) Write(b []byte) (int, error) {
-	return grw.writer.Write(b)
+func (g *gzipResponseWriter) commitGzip() {
+	if g.wroteHeader {
+		return
+	}
+	g.gzipOn = true
+	h := g.Header()
+	h.Del("Content-Length")
+	h.Set("Content-Encoding", "gzip")
+	h.Set("Vary", "Accept-Encoding")
+	g.gw = getGzipWriter(g.ResponseWriter, g.level)
+	g.wroteHeader = true
+	g.ResponseWriter.WriteHeader(g.status)
 }
 
+func (g *gzipResponseWriter) commitPlain() {
+	if g.wroteHeader {
+		return
+	}
+	g.wroteHeader = true
+	g.ResponseWriter.WriteHeader(g.status)
+}
+
+func (g *gzipResponseWriter) WriteHeader(code int) {
+	if g.wroteHeader {
+		return
+	}
+	g.status = code
+	if g.minLength <= 0 {
+		g.commitGzip()
+	}
+}
+
+func (g *gzipResponseWriter) Write(b []byte) (int, error) {
+	if g.status == 0 {
+		g.status = http.StatusOK
+	}
+	if g.wroteHeader {
+		if g.gzipOn {
+			return g.gw.Write(b)
+		}
+		return g.ResponseWriter.Write(b)
+	}
+	if g.minLength <= 0 {
+		g.commitGzip()
+		return g.gw.Write(b)
+	}
+	g.buf = append(g.buf, b...)
+	if len(g.buf) >= g.minLength {
+		g.commitGzip()
+		buf := g.buf
+		g.buf = nil
+		if _, err := g.gw.Write(buf); err != nil {
+			return 0, err
+		}
+	}
+	return len(b), nil
+}
+
+// finish flushes any buffered/compressed bytes and returns the writer to the
+// pool. It must be called after the wrapped handler returns.
+func (g *gzipResponseWriter) finish() {
+	if !g.wroteHeader {
+		g.commitPlain()
+		if len(g.buf) > 0 {
+			g.ResponseWriter.Write(g.buf)
+			g.buf = nil
+		}
+		return
+	}
+	if g.gzipOn && g.gw != nil {
+		g.gw.Close()
+		putGzipWriter(g.level, g.gw)
+		g.gw = nil
+	}
+}
+
+// gzipMiddleware keeps the historical single-argument signature (default level,
+// no minimum length) for callers and tests that don't need tuning.
 func gzipMiddleware(next http.Handler) http.Handler {
+	return gzipMiddlewareWith(next, -1, 0)
+}
+
+func gzipMiddlewareWith(next http.Handler, level, minLength int) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
 			next.ServeHTTP(w, r)
 			return
 		}
-
-		gw := gzip.NewWriter(w)
-		defer gw.Close()
-
-		w.Header().Set("Content-Encoding", "gzip")
-		w.Header().Set("Vary", "Accept-Encoding")
-
-		grw := &gzipResponseWriter{ResponseWriter: w, writer: gw}
+		grw := &gzipResponseWriter{ResponseWriter: w, level: level, minLength: minLength}
 		next.ServeHTTP(grw, r)
+		grw.finish()
 	})
 }

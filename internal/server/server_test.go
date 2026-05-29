@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -345,6 +346,142 @@ func TestGzipMiddleware(t *testing.T) {
 	})
 }
 
+func TestServer_TrailingSlashRouteNoPanic(t *testing.T) {
+	// A proxy route whose path already ends in "/" must not double-register the
+	// same ServeMux pattern (which would panic at startup).
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("api"))
+	}))
+	defer backend.Close()
+
+	cfg := config.Config{
+		Port: 0,
+		Routes: []config.Route{
+			{Path: "/api/", Upstreams: []string{backend.URL}},
+		},
+	}
+
+	srv := New(cfg) // would panic before the registerPattern fix
+
+	rec := httptest.NewRecorder()
+	srv.mux.ServeHTTP(rec, httptest.NewRequest("GET", "/api/things", nil))
+	if rec.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	if rec.Body.String() != "api" {
+		t.Errorf("body = %q, want %q", rec.Body.String(), "api")
+	}
+}
+
+func TestGzipMinLength(t *testing.T) {
+	big := strings.Repeat("x", 500)
+	inner := func(body string) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Write([]byte(body))
+		})
+	}
+
+	t.Run("below threshold stays plain", func(t *testing.T) {
+		handler := gzipMiddlewareWith(inner("tiny"), -1, 100)
+		req := httptest.NewRequest("GET", "/", nil)
+		req.Header.Set("Accept-Encoding", "gzip")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Header().Get("Content-Encoding") == "gzip" {
+			t.Error("small body should not be gzipped")
+		}
+		if rec.Body.String() != "tiny" {
+			t.Errorf("body = %q, want %q", rec.Body.String(), "tiny")
+		}
+	})
+
+	t.Run("above threshold compresses", func(t *testing.T) {
+		handler := gzipMiddlewareWith(inner(big), -1, 100)
+		req := httptest.NewRequest("GET", "/", nil)
+		req.Header.Set("Accept-Encoding", "gzip")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Header().Get("Content-Encoding") != "gzip" {
+			t.Fatal("large body should be gzipped")
+		}
+		gr, err := gzip.NewReader(rec.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer gr.Close()
+		got, _ := io.ReadAll(gr)
+		if string(got) != big {
+			t.Errorf("decompressed body mismatch")
+		}
+	})
+}
+
+func TestGzipWriterPoolReuse(t *testing.T) {
+	handler := gzipMiddlewareWith(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("hello world hello world"))
+	}), -1, 0)
+
+	for i := 0; i < 50; i++ {
+		req := httptest.NewRequest("GET", "/", nil)
+		req.Header.Set("Accept-Encoding", "gzip")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Header().Get("Content-Encoding") != "gzip" {
+			t.Fatalf("iteration %d: missing gzip encoding", i)
+		}
+		gr, err := gzip.NewReader(rec.Body)
+		if err != nil {
+			t.Fatalf("iteration %d: %v", i, err)
+		}
+		got, _ := io.ReadAll(gr)
+		gr.Close()
+		if string(got) != "hello world hello world" {
+			t.Fatalf("iteration %d: body mismatch %q", i, got)
+		}
+	}
+}
+
+func TestRateLimiterSweepEvictsIdle(t *testing.T) {
+	rl := newRateLimiter(100, 10, 10*time.Millisecond)
+
+	if !rl.allow("1.2.3.4") {
+		t.Fatal("first request should be allowed")
+	}
+	if got := countBuckets(rl); got != 1 {
+		t.Fatalf("buckets = %d, want 1", got)
+	}
+
+	time.Sleep(20 * time.Millisecond)
+	rl.sweep()
+
+	if got := countBuckets(rl); got != 0 {
+		t.Errorf("buckets after sweep = %d, want 0 (idle bucket should be evicted)", got)
+	}
+}
+
+func TestRateLimiterShardingDistributes(t *testing.T) {
+	rl := newRateLimiter(100, 10, time.Minute)
+	for _, ip := range []string{"1.1.1.1", "2.2.2.2", "3.3.3.3", "4.4.4.4"} {
+		rl.allow(ip)
+	}
+	if got := countBuckets(rl); got != 4 {
+		t.Errorf("distinct buckets = %d, want 4", got)
+	}
+}
+
+func countBuckets(rl *rateLimiter) int {
+	n := 0
+	for i := range rl.shards {
+		rl.shards[i].mu.Lock()
+		n += len(rl.shards[i].buckets)
+		rl.shards[i].mu.Unlock()
+	}
+	return n
+}
+
 func TestHostBasedRouting(t *testing.T) {
 	dir := t.TempDir()
 	if err := writeFile(dir+"/index.html", "host content", 0644); err != nil {
@@ -433,9 +570,9 @@ func TestServer_StaticRouteWithSetHeaders(t *testing.T) {
 		Port: 0,
 		Routes: []config.Route{
 			{
-				Path:        "/",
-				StaticDir:   dir,
-				SetHeaders:  map[string]string{"Access-Control-Allow-Origin": "*"},
+				Path:       "/",
+				StaticDir:  dir,
+				SetHeaders: map[string]string{"Access-Control-Allow-Origin": "*"},
 			},
 		},
 	}

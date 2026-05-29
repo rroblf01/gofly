@@ -26,7 +26,9 @@
       "path": "/",
       "static_dir": "/var/www/html",
       "browser_cache_ttl": "3600s",
-      "gzip": true
+      "static_cache_ttl": "60s",
+      "gzip": true,
+      "gzip_min_length": 1024
     }
   ],
   "tls": {

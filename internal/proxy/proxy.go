@@ -21,13 +21,27 @@ type UpstreamSetter interface {
 }
 
 var DefaultTransport = &http.Transport{
-	MaxIdleConns:        100,
-	MaxIdleConnsPerHost: 10,
+	MaxIdleConns:        1024,
+	MaxIdleConnsPerHost: 256,
+	MaxConnsPerHost:     0,
 	IdleConnTimeout:     90 * time.Second,
+	ForceAttemptHTTP2:   true,
+	WriteBufferSize:     64 << 10,
+	ReadBufferSize:      64 << 10,
 	TLSClientConfig: &tls.Config{
 		InsecureSkipVerify: false,
 	},
 	DisableCompression: false,
+}
+
+// wsBufPool recycles the 32 KiB relay buffers used to shuttle bytes between the
+// client and upstream on hijacked WebSocket connections, so long-lived
+// connections don't each pin two fresh buffers.
+var wsBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 32*1024)
+		return &b
+	},
 }
 
 type UpstreamState struct {
@@ -73,9 +87,13 @@ func transportForRoute(route config.Route) *http.Transport {
 	t := DefaultTransport
 	if route.UpstreamTimeout != nil {
 		t = &http.Transport{
-			MaxIdleConns:          100,
-			MaxIdleConnsPerHost:   10,
+			MaxIdleConns:          1024,
+			MaxIdleConnsPerHost:   256,
+			MaxConnsPerHost:       0,
 			IdleConnTimeout:       90 * time.Second,
+			ForceAttemptHTTP2:     true,
+			WriteBufferSize:       64 << 10,
+			ReadBufferSize:        64 << 10,
 			TLSClientConfig:       &tls.Config{InsecureSkipVerify: false},
 			DisableCompression:    false,
 			ResponseHeaderTimeout: route.UpstreamTimeout.Duration,
@@ -127,7 +145,9 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (p *Proxy) applyDirector(req *http.Request) {
-	req.Header.Set("X-Forwarded-For", req.RemoteAddr)
+	// X-Forwarded-For is left to httputil.ReverseProxy, which appends the
+	// parsed client IP (without port) to any existing chain. For the hijacked
+	// WebSocket path we set it explicitly in serveWebSocket.
 	req.Header.Set("X-Forwarded-Host", req.Host)
 	req.Header.Set("X-Forwarded-Proto", scheme(req))
 
@@ -235,6 +255,16 @@ func isWebSocket(r *http.Request) bool {
 func (p *Proxy) serveWebSocket(w http.ResponseWriter, r *http.Request, target *url.URL) {
 	p.applyDirector(r)
 
+	clientIP := r.RemoteAddr
+	if host, _, err := net.SplitHostPort(clientIP); err == nil {
+		clientIP = host
+	}
+	if prior := r.Header.Get("X-Forwarded-For"); prior != "" {
+		r.Header.Set("X-Forwarded-For", prior+", "+clientIP)
+	} else {
+		r.Header.Set("X-Forwarded-For", clientIP)
+	}
+
 	targetAddr := target.Host
 	if !strings.Contains(targetAddr, ":") {
 		if target.Scheme == "https" || target.Scheme == "wss" {
@@ -278,11 +308,15 @@ func (p *Proxy) serveWebSocket(w http.ResponseWriter, r *http.Request, target *u
 
 	go func() {
 		defer wg.Done()
-		io.Copy(upstreamConn, clientConn)
+		buf := wsBufPool.Get().(*[]byte)
+		defer wsBufPool.Put(buf)
+		io.CopyBuffer(upstreamConn, clientConn, *buf)
 	}()
 	go func() {
 		defer wg.Done()
-		io.Copy(clientConn, upstreamConn)
+		buf := wsBufPool.Get().(*[]byte)
+		defer wsBufPool.Put(buf)
+		io.CopyBuffer(clientConn, upstreamConn, *buf)
 	}()
 
 	wg.Wait()
@@ -303,5 +337,3 @@ func scheme(r *http.Request) string {
 	}
 	return "http"
 }
-
-
