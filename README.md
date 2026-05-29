@@ -418,14 +418,14 @@ git push origin v0.1.0
 ### Go benchmarks (internal, per-core)
 
 | Benchmark | Ops | Latency | Allocs/op | Bytes/op |
-|---|---|---|---|---|
-| Reverse proxy (single upstream) | 14,431 | 81.4 µs | 167 | 54,839 |
-| Reverse proxy (3 upstreams, round-robin) | 14,899 | 85.2 µs | 166 | 54,703 |
-| Static file (small, 13 B) | 64,845 | 18.3 µs | 119 | 11,458 |
-| Static file (large, 256 KB) | 20,676 | 52.5 µs | 110 | 17,051 |
-| Proxy throughput (sequential) | 7,226 | 138.5 µs | 150 | 46,108 |
-| Real-world page (HTML+CSS+JS) | 7,430 | 156.5 µs | 166 | 15,398 |
-| **Heap alloc per request** | **7,467** | **143.1 µs** | **13.71 B/req** | **46,174** |
+|---|---|---|---|---|---|
+| Reverse proxy (single upstream) | 14,911 | 81.6 µs | 168 | 54,991 |
+| Reverse proxy (3 upstreams, round-robin) | 14,486 | 82.1 µs | 167 | 55,274 |
+| Static file (small, 13 B) | 35,677 | 34.0 µs | 118 | 15,098 |
+| Static file (large, 256 KB) | 20,604 | 54.8 µs | 120 | 17,349 |
+| Proxy throughput (sequential) | 8,442 | 136.0 µs | 150 | 46,161 |
+| Real-world page (HTML+CSS+JS) | 13,670 | 86.5 µs | 102 | 8,319 |
+| **Heap alloc per request** | **8,606** | **135.4 µs** | **10.55 B/req** | **46,121** |
 
 > Note: Parallel benchmarks use `RunParallel` and auto-scale to GOMAXPROCS (12 cores).
 
