@@ -22,12 +22,12 @@ possible. We aim to acknowledge reports within a few days.
 gofly is designed to sit at the edge or in front of application backends. A few
 things to be aware of when deploying:
 
-- **`X-Forwarded-For` is client-controlled.** gofly's rate limiter keys on the
-  first `X-Forwarded-For` value when present, falling back to the socket peer
-  address. If gofly is directly internet-facing, a client can spoof this header
-  to evade or amplify per-IP limits. Only trust `X-Forwarded-For` when gofly is
-  behind a trusted load balancer that sets it; otherwise rely on the peer
-  address. The idle-bucket janitor bounds memory regardless.
+- **`X-Forwarded-For` is not trusted by default.** The rate limiter keys on the
+  socket peer address, so a direct client cannot spoof `X-Forwarded-For` to
+  evade or amplify per-IP limits. Set `"trust_forwarded_for": true` **only** when
+  gofly sits behind a trusted load balancer/proxy that sets the header; then the
+  first hop is used. The idle-bucket janitor bounds the limiter's memory
+  regardless of trust.
 - **TLS.** gofly serves HTTP/2 automatically on the TLS listener. It does not
   manage certificates (no ACME yet) — provide `cert_file`/`key_file` and rotate
   them via your own tooling, then `SIGHUP` to reload.

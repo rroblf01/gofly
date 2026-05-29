@@ -95,9 +95,13 @@ func main() {
 	}
 
 	if *testConfig {
-		// In file mode config.Load already loaded and validated the config (it
-		// would have exited above on failure); configless config is valid by
-		// construction. Reaching here means the configuration is good.
+		// config.Load already validated the schema in file mode; additionally
+		// build the routing table so route conflicts are caught here rather
+		// than panicking at startup.
+		if err := server.CheckRoutes(cfg); err != nil {
+			logger.Error("configuration test failed", logger.LogFields{"error": err.Error()})
+			os.Exit(1)
+		}
 		if path != "" {
 			fmt.Printf("gofly: the configuration file %s syntax is ok\n", path)
 		} else {

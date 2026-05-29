@@ -182,14 +182,31 @@ func New(cfg config.Config) *Server {
 	s.startHealthChecks()
 
 	s.http = &http.Server{
-		Addr:         fmt.Sprintf(":%d", cfg.Port),
-		Handler:      handler,
-		ReadTimeout:  cfg.ReadTimeout.Duration,
-		WriteTimeout: cfg.WriteTimeout.Duration,
-		IdleTimeout:  cfg.IdleTimeout.Duration,
+		Addr:              fmt.Sprintf(":%d", cfg.Port),
+		Handler:           handler,
+		ReadTimeout:       cfg.ReadTimeout.Duration,
+		ReadHeaderTimeout: cfg.ReadTimeout.Duration,
+		WriteTimeout:      cfg.WriteTimeout.Duration,
+		IdleTimeout:       cfg.IdleTimeout.Duration,
+		ErrorLog:          logger.StdLogger(),
 	}
 
 	return s
+}
+
+// CheckRoutes builds the routing table for cfg without starting any listeners
+// or background goroutines, so `gofly -t` catches errors that would otherwise
+// only surface (or panic) at startup. It recovers from any registration panic
+// and returns it as an error.
+func CheckRoutes(cfg config.Config) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("route registration failed: %v", r)
+		}
+	}()
+	s := &Server{cfg: cfg, mux: http.NewServeMux()}
+	s.registerRoutes()
+	return nil
 }
 
 func (s *Server) newRateLimiterFromCfg() *rateLimiter {
@@ -279,21 +296,36 @@ func (s *Server) startRateLimitJanitor() {
 	}()
 }
 
+// vhostEntry binds a handler to an optional server_name (empty = catch-all)
+// within a single ServeMux pattern.
+type vhostEntry struct {
+	serverName string
+	handler    http.Handler
+}
+
 func (s *Server) registerRoutes() {
 	s.proxies = nil
+
+	// Collect handlers per ServeMux pattern so that multiple routes sharing a
+	// pattern (e.g. several virtual hosts on "/") register exactly one handler
+	// that dispatches by Host — registering the same pattern twice panics.
+	patterns := map[string][]vhostEntry{}
+	var order []string
+	add := func(pattern, serverName string, h http.Handler) {
+		if _, ok := patterns[pattern]; !ok {
+			order = append(order, pattern)
+		}
+		patterns[pattern] = append(patterns[pattern], vhostEntry{serverName, h})
+	}
+
 	for _, route := range s.cfg.Routes {
 		route := route
+		var h http.Handler
 		switch {
 		case route.StaticDir != "":
-			var h http.Handler = static.New(route)
+			h = static.New(route)
 			if gzipEnabled(route) {
 				h = gzipMiddlewareWith(h, route.GzipCompressionLevel(), route.GzipMinLength)
-			}
-			if route.ServerName != "" {
-				s.mux.HandleFunc(route.Path, s.hostHandler(route.ServerName, h))
-				s.mux.HandleFunc(route.Path+"/", s.hostHandler(route.ServerName, h))
-			} else {
-				s.registerPattern(route.Path, h)
 			}
 			logger.Info("registered static route", logger.LogFields{
 				"path": route.Path,
@@ -311,22 +343,27 @@ func (s *Server) registerRoutes() {
 				continue
 			}
 			s.proxies = append(s.proxies, p)
-			var h http.Handler = p
+			h = p
 			if gzipEnabled(route) {
 				h = gzipMiddlewareWith(h, route.GzipCompressionLevel(), route.GzipMinLength)
-			}
-			if route.ServerName != "" {
-				s.mux.HandleFunc(route.Path, s.hostHandler(route.ServerName, h))
-				s.mux.HandleFunc(route.Path+"/", s.hostHandler(route.ServerName, h))
-			} else {
-				s.registerPattern(route.Path, h)
 			}
 			logger.Info("registered proxy route", logger.LogFields{
 				"path":      route.Path,
 				"upstreams": route.Upstreams,
 				"host":      route.ServerName,
 			})
+
+		default:
+			continue
 		}
+
+		for _, pat := range routePatterns(route.Path) {
+			add(pat, route.ServerName, h)
+		}
+	}
+
+	for _, pat := range order {
+		s.mux.Handle(pat, vhostDispatcher(patterns[pat]))
 	}
 
 	s.mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
@@ -385,32 +422,53 @@ func (s *Server) metricsHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write(b)
 }
 
-func (s *Server) hostHandler(serverName string, handler http.Handler) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Host == serverName {
-			handler.ServeHTTP(w, r)
-			return
-		}
-		http.NotFound(w, r)
+// routePatterns returns the ServeMux patterns a route path maps to. A bare
+// prefix like "/api" also registers the subtree "/api/"; "/" and paths that
+// already end in "/" map to a single pattern.
+func routePatterns(path string) []string {
+	if path == "/" || path[len(path)-1] == '/' {
+		return []string{path}
 	}
+	return []string{path, path + "/"}
 }
 
-func (s *Server) registerPattern(path string, handler http.Handler) {
-	if path == "/" {
-		s.mux.Handle("/", handler)
-		return
+// vhostDispatcher returns a handler for one ServeMux pattern. With a single
+// catch-all entry it's the handler itself; otherwise it dispatches by Host,
+// preferring an exact server_name match and falling back to a catch-all entry.
+func vhostDispatcher(entries []vhostEntry) http.Handler {
+	if len(entries) == 1 && entries[0].serverName == "" {
+		return entries[0].handler
 	}
-	s.mux.Handle(path, handler)
-	// Register the subtree variant too, but only when path doesn't already end
-	// in "/" — otherwise ServeMux panics on the duplicate pattern.
-	if path[len(path)-1] != '/' {
-		s.mux.Handle(path+"/", handler)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		for _, e := range entries {
+			if e.serverName != "" && hostMatches(e.serverName, r.Host) {
+				e.handler.ServeHTTP(w, r)
+				return
+			}
+		}
+		for _, e := range entries {
+			if e.serverName == "" {
+				e.handler.ServeHTTP(w, r)
+				return
+			}
+		}
+		http.NotFound(w, r)
+	})
+}
+
+// hostMatches compares a configured server_name against a request Host header,
+// ignoring any port and case.
+func hostMatches(serverName, host string) bool {
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
 	}
+	return strings.EqualFold(host, serverName)
 }
 
 func (s *Server) rateLimitMiddleware(rl *rateLimiter, next http.Handler) http.Handler {
+	trustForwarded := s.cfg.TrustForwardedFor != nil && *s.cfg.TrustForwardedFor
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !rl.allow(extractIP(r)) {
+		if !rl.allow(extractIP(r, trustForwarded)) {
 			w.Header().Set("Retry-After", "1")
 			http.Error(w, "too many requests", http.StatusTooManyRequests)
 			return
@@ -458,22 +516,36 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 			defer metrics.DecInFlight()
 		}
 
+		// Finalize on the way out — runs on both normal return and panic, so a
+		// recovered handler is still counted (as 5xx) and logged.
+		defer func() {
+			if rec := recover(); rec != nil {
+				if !lrw.written {
+					lrw.WriteHeader(http.StatusInternalServerError)
+				}
+				logger.Error("panic recovered", logger.LogFields{
+					"method": r.Method,
+					"path":   r.URL.Path,
+					"panic":  fmt.Sprint(rec),
+				})
+			}
+			dur := time.Since(start)
+			if metricsOn {
+				metrics.Observe(lrw.status, lrw.bytes, dur.Nanoseconds())
+			}
+			if logOn {
+				select {
+				case s.logCh <- logEntry{start, r.Method, r.URL.Path, lrw.status, dur, lrw.upstream}:
+				default:
+				}
+			}
+		}()
+
 		if id := r.Header.Get("X-Request-ID"); id != "" {
 			r = r.WithContext(logger.WithRequestID(r.Context(), id))
 		}
 
 		next.ServeHTTP(lrw, r)
-
-		dur := time.Since(start)
-		if metricsOn {
-			metrics.Observe(lrw.status, lrw.bytes, dur.Nanoseconds())
-		}
-		if logOn {
-			select {
-			case s.logCh <- logEntry{start, r.Method, r.URL.Path, lrw.status, dur, lrw.upstream}:
-			default:
-			}
-		}
 	})
 }
 
@@ -662,15 +734,21 @@ func (rw *responseWriter) ReadFrom(r io.Reader) (int64, error) {
 	return n, err
 }
 
-func extractIP(r *http.Request) string {
-	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
-		if idx := strings.IndexByte(fwd, ','); idx > 0 {
-			return fwd[:idx]
+// extractIP returns the client IP used for rate limiting. It only honors
+// X-Forwarded-For when trustForwarded is set (gofly is behind a trusted proxy);
+// otherwise it uses the socket peer address, so a direct client cannot spoof
+// its identity to evade per-IP limits.
+func extractIP(r *http.Request, trustForwarded bool) string {
+	if trustForwarded {
+		if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
+			if idx := strings.IndexByte(fwd, ','); idx > 0 {
+				return strings.TrimSpace(fwd[:idx])
+			}
+			return strings.TrimSpace(fwd)
 		}
-		return fwd
 	}
-	if idx := strings.LastIndexByte(r.RemoteAddr, ':'); idx > 0 {
-		return r.RemoteAddr[:idx]
+	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		return host
 	}
 	return r.RemoteAddr
 }
@@ -743,11 +821,22 @@ func (g *gzipResponseWriter) commitPlain() {
 	g.ResponseWriter.WriteHeader(g.status)
 }
 
+// bodyless reports whether a status code must not carry a response body, in
+// which case gzip is skipped (compressing a 304/204 would emit a gzip stream as
+// an illegal body).
+func bodyless(code int) bool {
+	return code == http.StatusNoContent || code == http.StatusNotModified || (code >= 100 && code < 200)
+}
+
 func (g *gzipResponseWriter) WriteHeader(code int) {
 	if g.wroteHeader {
 		return
 	}
 	g.status = code
+	if bodyless(code) {
+		g.commitPlain()
+		return
+	}
 	if g.minLength <= 0 {
 		g.commitGzip()
 	}

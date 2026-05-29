@@ -1,8 +1,11 @@
 package proxy
 
 import (
+	"bufio"
 	"crypto/tls"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -376,6 +379,113 @@ func TestProxy_HealthCheckNoopWithoutPath(t *testing.T) {
 	// Start/Stop must be safe no-ops when no health_check_path is configured.
 	p.Start()
 	p.Stop()
+}
+
+func TestProxy_PassiveDisableAfterMaxFails(t *testing.T) {
+	logger.Init()
+
+	failTimeout := config.Duration{Duration: time.Minute}
+	route := config.Route{
+		Path:        "/",
+		Upstreams:   []string{"http://127.0.0.1:1"}, // connection refused
+		MaxFails:    2,
+		FailTimeout: &failTimeout,
+	}
+	p, err := New(route)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frontend := httptest.NewServer(p)
+	defer frontend.Close()
+
+	// First two requests fail with 502 and accumulate failures.
+	for i := 0; i < 2; i++ {
+		resp, err := http.Get(frontend.URL + "/")
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusBadGateway {
+			t.Errorf("request %d: status = %d, want 502", i+1, resp.StatusCode)
+		}
+	}
+
+	// The upstream is now disabled → no healthy upstream → 503.
+	resp, err := http.Get(frontend.URL + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("after max_fails: status = %d, want 503", resp.StatusCode)
+	}
+}
+
+func TestProxy_WebSocketRelay(t *testing.T) {
+	logger.Init()
+
+	// Backend completes the upgrade handshake and echoes one line.
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, buf, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		buf.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+		buf.Flush()
+		line, err := buf.ReadString('\n')
+		if err != nil {
+			return
+		}
+		buf.WriteString(line)
+		buf.Flush()
+	}))
+	defer backend.Close()
+
+	p, err := New(config.Route{Path: "/", Upstreams: []string{backend.URL}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	frontend := httptest.NewServer(p)
+	defer frontend.Close()
+
+	addr := strings.TrimPrefix(frontend.URL, "http://")
+	c, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	c.SetDeadline(time.Now().Add(3 * time.Second))
+
+	fmt.Fprint(c, "GET / HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
+	br := bufio.NewReader(c)
+
+	status, err := br.ReadString('\n')
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(status, "101") {
+		t.Fatalf("expected 101 Switching Protocols, got %q", status)
+	}
+	// Drain headers until the blank line.
+	for {
+		line, err := br.ReadString('\n')
+		if err != nil {
+			t.Fatal(err)
+		}
+		if line == "\r\n" || line == "\n" {
+			break
+		}
+	}
+
+	fmt.Fprint(c, "ping\n")
+	echo, err := br.ReadString('\n')
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(echo) != "ping" {
+		t.Errorf("echo = %q, want %q", strings.TrimSpace(echo), "ping")
+	}
 }
 
 func TestScheme_HTTP(t *testing.T) {

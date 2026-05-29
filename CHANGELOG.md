@@ -11,8 +11,17 @@ covered by [SemVer](https://semver.org/): no incompatible changes within `1.x`.
 - **Prometheus metrics** — new `/metrics` endpoint (text exposition format, zero-dependency) exposing request counts by status class, in-flight requests, response bytes, cumulative request duration, goroutine/heap gauges, and per-upstream health/in-flight. Toggle with `"metrics": false`.
 - **Active health checks** — `health_check_path` + `health_check_interval` periodically probe each upstream and toggle it in/out of rotation, complementing the existing passive detection.
 - **`least_conn` load balancing** — new `strategy` value that routes to the healthy upstream with the fewest in-flight requests (round-robin tie-break).
-- **`gofly -t`** — load and validate the configuration, then exit; non-zero on error (like `nginx -t`). Wired into the systemd unit's `ExecStartPre`.
+- **`gofly -t`** — load and validate the configuration **and build the routing table**, then exit; non-zero on error (like `nginx -t`). Catches route conflicts that would otherwise panic at startup. Wired into the systemd unit's `ExecStartPre`.
 - **Build version injection** — `-version` now reports the real build version via `-ldflags -X main.version`, also surfaced as `gofly_build_info`.
+
+### Hardening / robustness
+
+- **Host-aware routing** — virtual hosts can now share a path (e.g. several domains serving `/`); requests dispatch by `Host` with exact-match priority and a catch-all fallback. Previously this panicked at startup (`ServeMux` duplicate pattern).
+- **Panic recovery** — a panicking handler no longer drops the connection: it returns 500, is logged structurally, and is counted as 5xx in metrics (the server already survived, but it's now observable).
+- **Duplicate-route detection** — `validate()` rejects two routes with the same `(path, server_name)` instead of allowing a silently-dead route.
+- **Slowloris** — `ReadHeaderTimeout` is now set; `http.Server.ErrorLog` is routed through the structured logger so TLS/connection errors stay in the JSON stream.
+- **`X-Forwarded-For` not trusted by default** — the rate limiter keys on the socket peer address; set `"trust_forwarded_for": true` only behind a trusted proxy. Prevents spoofed per-IP limit bypass.
+- **gzip skips bodyless responses** — 204/304/1xx are no longer gzip-encoded (which would have emitted an illegal body); `Content-Length` is stripped on compressed responses.
 
 ### Operability
 
@@ -38,7 +47,7 @@ covered by [SemVer](https://semver.org/): no incompatible changes within `1.x`.
 ### Options added
 
 - Route: `static_cache_ttl`, `precompressed` (default `true`), `gzip_level`, `gzip_min_length`, `strategy: "least_conn"`, `health_check_path`, `health_check_interval`
-- Global: `gogc`, `metrics` (default `true`), `rate_limit.idle_ttl`
+- Global: `gogc`, `metrics` (default `true`), `trust_forwarded_for` (default `false`), `rate_limit.idle_ttl`
 
 ## v0.1.0 (2026-05-29)
 

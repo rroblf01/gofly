@@ -244,13 +244,18 @@ func TestExtractIP(t *testing.T) {
 		name       string
 		remoteAddr string
 		headers    map[string]string
+		trust      bool
 		want       string
 	}{
-		{"X-Forwarded-For single", "1.1.1.1:1234", map[string]string{"X-Forwarded-For": "2.2.2.2"}, "2.2.2.2"},
-		{"X-Forwarded-For multi", "1.1.1.1:1234", map[string]string{"X-Forwarded-For": "2.2.2.2, 3.3.3.3"}, "2.2.2.2"},
-		{"RemoteAddr IPv4", "4.4.4.4:5678", nil, "4.4.4.4"},
-		{"RemoteAddr IPv6", "[::1]:8080", nil, "[::1]"},
-		{"RemoteAddr no port", "5.5.5.5", nil, "5.5.5.5"},
+		// Untrusted (default): always use the socket peer, ignore XFF.
+		{"untrusted ignores XFF", "1.1.1.1:1234", map[string]string{"X-Forwarded-For": "2.2.2.2"}, false, "1.1.1.1"},
+		{"RemoteAddr IPv4", "4.4.4.4:5678", nil, false, "4.4.4.4"},
+		{"RemoteAddr IPv6", "[::1]:8080", nil, false, "::1"},
+		{"RemoteAddr no port", "5.5.5.5", nil, false, "5.5.5.5"},
+		// Trusted: honor the first XFF hop.
+		{"trusted XFF single", "1.1.1.1:1234", map[string]string{"X-Forwarded-For": "2.2.2.2"}, true, "2.2.2.2"},
+		{"trusted XFF multi", "1.1.1.1:1234", map[string]string{"X-Forwarded-For": "2.2.2.2, 3.3.3.3"}, true, "2.2.2.2"},
+		{"trusted but no XFF falls back to peer", "9.9.9.9:1", nil, true, "9.9.9.9"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -259,7 +264,7 @@ func TestExtractIP(t *testing.T) {
 			for k, v := range tt.headers {
 				req.Header.Set(k, v)
 			}
-			got := extractIP(req)
+			got := extractIP(req, tt.trust)
 			if got != tt.want {
 				t.Errorf("extractIP = %q, want %q", got, tt.want)
 			}
@@ -472,6 +477,66 @@ func TestGzipMinLength(t *testing.T) {
 	})
 }
 
+func TestGzip304NotCompressed(t *testing.T) {
+	// A handler that returns 304 (no body) must not be gzipped — otherwise the
+	// gzip trailer becomes an illegal body on a 304.
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", `"abc"`)
+		w.WriteHeader(http.StatusNotModified)
+	})
+	handler := gzipMiddlewareWith(inner, -1, 0)
+
+	req := httptest.NewRequest("GET", "/", nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotModified {
+		t.Errorf("status = %d, want 304", rec.Code)
+	}
+	if rec.Header().Get("Content-Encoding") == "gzip" {
+		t.Error("304 response must not be gzip-encoded")
+	}
+	if rec.Body.Len() != 0 {
+		t.Errorf("304 response must have empty body, got %d bytes", rec.Body.Len())
+	}
+	if rec.Header().Get("ETag") != `"abc"` {
+		t.Error("ETag header should be preserved on 304")
+	}
+}
+
+func TestGzipExplicitWriteHeader(t *testing.T) {
+	// minLength>0 with an explicit non-OK status, body above threshold → gzipped
+	// and status preserved.
+	big := strings.Repeat("y", 300)
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusAccepted)
+		w.Write([]byte(big))
+	})
+	handler := gzipMiddlewareWith(inner, -1, 100)
+
+	req := httptest.NewRequest("GET", "/", nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Errorf("status = %d, want 202", rec.Code)
+	}
+	if rec.Header().Get("Content-Encoding") != "gzip" {
+		t.Fatal("expected gzip encoding for body above threshold")
+	}
+	gr, err := gzip.NewReader(rec.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _ := io.ReadAll(gr)
+	gr.Close()
+	if string(got) != big {
+		t.Error("decompressed body mismatch")
+	}
+}
+
 func TestGzipWriterPoolReuse(t *testing.T) {
 	handler := gzipMiddlewareWith(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("hello world hello world"))
@@ -495,6 +560,48 @@ func TestGzipWriterPoolReuse(t *testing.T) {
 		if string(got) != "hello world hello world" {
 			t.Fatalf("iteration %d: body mismatch %q", i, got)
 		}
+	}
+}
+
+func TestRateLimitMiddleware(t *testing.T) {
+	cfg := config.Config{
+		Port:      0,
+		RateLimit: &config.RateLimit{RequestsPerSecond: 0, Burst: 2},
+		Routes:    []config.Route{},
+	}
+	srv := New(cfg)
+	h := srv.rateLimitMiddleware(srv.rl.Load(), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	call := func(remote, xff string) int {
+		req := httptest.NewRequest("GET", "/", nil)
+		req.RemoteAddr = remote
+		if xff != "" {
+			req.Header.Set("X-Forwarded-For", xff)
+		}
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec.Code
+	}
+
+	// Burst of 2 for the same peer, then 429.
+	if call("9.9.9.9:1", "") != http.StatusOK || call("9.9.9.9:2", "") != http.StatusOK {
+		t.Fatal("first two requests within burst should pass")
+	}
+	if got := call("9.9.9.9:3", ""); got != http.StatusTooManyRequests {
+		t.Errorf("third request = %d, want 429", got)
+	}
+
+	// Spoofing X-Forwarded-For must NOT bypass the limit (untrusted by default):
+	// still keyed by the peer 9.9.9.9.
+	if got := call("9.9.9.9:4", "1.2.3.4"); got != http.StatusTooManyRequests {
+		t.Errorf("spoofed XFF bypassed the limit: got %d, want 429", got)
+	}
+
+	// A different peer is independent.
+	if got := call("8.8.8.8:1", ""); got != http.StatusOK {
+		t.Errorf("different peer = %d, want 200", got)
 	}
 }
 
@@ -573,6 +680,124 @@ func TestHostBasedRouting(t *testing.T) {
 
 		if rec.Code != http.StatusNotFound {
 			t.Errorf("status = %d, want %d", rec.Code, http.StatusNotFound)
+		}
+	})
+}
+
+func TestHostBasedRouting_SamePathMultipleVHosts(t *testing.T) {
+	dirA := t.TempDir()
+	dirB := t.TempDir()
+	if err := writeFile(dirA+"/index.html", "site A", 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeFile(dirB+"/index.html", "site B", 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := config.Config{
+		Port: 0,
+		Routes: []config.Route{
+			{Path: "/", ServerName: "a.example.com", StaticDir: dirA},
+			{Path: "/", ServerName: "b.example.com", StaticDir: dirB},
+		},
+	}
+	srv := New(cfg) // must NOT panic (regression: duplicate "/" pattern)
+
+	cases := map[string]string{
+		"a.example.com":      "site A",
+		"b.example.com":      "site B",
+		"a.example.com:8080": "site A", // host with port still matches
+	}
+	for host, want := range cases {
+		req := httptest.NewRequest("GET", "/", nil)
+		req.Host = host
+		rec := httptest.NewRecorder()
+		srv.mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Errorf("host %q: status = %d, want 200", host, rec.Code)
+		}
+		if rec.Body.String() != want {
+			t.Errorf("host %q: body = %q, want %q", host, rec.Body.String(), want)
+		}
+	}
+
+	// Unknown host with no catch-all route => 404.
+	req := httptest.NewRequest("GET", "/", nil)
+	req.Host = "unknown.example.com"
+	rec := httptest.NewRecorder()
+	srv.mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("unknown host: status = %d, want 404", rec.Code)
+	}
+}
+
+func TestHostBasedRouting_CatchAllFallback(t *testing.T) {
+	dirA := t.TempDir()
+	dirDefault := t.TempDir()
+	if err := writeFile(dirA+"/index.html", "A", 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeFile(dirDefault+"/index.html", "DEFAULT", 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := config.Config{
+		Port: 0,
+		Routes: []config.Route{
+			{Path: "/", ServerName: "a.example.com", StaticDir: dirA},
+			{Path: "/", StaticDir: dirDefault}, // catch-all
+		},
+	}
+	srv := New(cfg)
+
+	cases := map[string]string{
+		"a.example.com":     "A",
+		"anything-else.com": "DEFAULT",
+	}
+	for host, want := range cases {
+		req := httptest.NewRequest("GET", "/", nil)
+		req.Host = host
+		rec := httptest.NewRecorder()
+		srv.mux.ServeHTTP(rec, req)
+		if rec.Body.String() != want {
+			t.Errorf("host %q: body = %q, want %q", host, rec.Body.String(), want)
+		}
+	}
+}
+
+func TestServer_PanicRecovery(t *testing.T) {
+	cfg := config.Config{Port: 0, Routes: []config.Route{}}
+	srv := New(cfg)
+
+	panicHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		panic("boom")
+	})
+	h := srv.middleware(panicHandler)
+
+	rec := httptest.NewRecorder()
+	// Must not propagate the panic; should yield a 500.
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/", nil))
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Errorf("status = %d, want %d after recovered panic", rec.Code, http.StatusInternalServerError)
+	}
+}
+
+func TestCheckRoutes(t *testing.T) {
+	t.Run("valid config", func(t *testing.T) {
+		cfg := config.Config{Routes: []config.Route{{Path: "/", StaticDir: "/tmp"}}}
+		if err := CheckRoutes(cfg); err != nil {
+			t.Errorf("CheckRoutes on valid config: %v", err)
+		}
+	})
+
+	t.Run("vhost same path does not error", func(t *testing.T) {
+		cfg := config.Config{Routes: []config.Route{
+			{Path: "/", ServerName: "a.com", StaticDir: "/tmp"},
+			{Path: "/", ServerName: "b.com", StaticDir: "/tmp"},
+		}}
+		if err := CheckRoutes(cfg); err != nil {
+			t.Errorf("CheckRoutes on vhost config: %v", err)
 		}
 	})
 }

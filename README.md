@@ -186,6 +186,7 @@ gofly uses a single JSON config file. Default path: `/etc/gofly/config.json` (ov
 | `memory_limit` | int | `104857600` (100 MB) | Soft heap limit in bytes (`debug.SetMemoryLimit`) |
 | `gogc` | int | — | `GOGC` percent (`debug.SetGCPercent`); higher = fewer GC cycles, more RAM |
 | `metrics` | bool | `true` | Expose the `/metrics` endpoint and record counters |
+| `trust_forwarded_for` | bool | `false` | Trust `X-Forwarded-For` for the client IP (rate limiting). Enable only behind a trusted proxy |
 | `rate_limit` | object | — | Global rate limiting config |
 | `rate_limit.requests_per_second` | float | — | Requests per second per IP |
 | `rate_limit.burst` | int | — | Burst capacity |

@@ -2,6 +2,7 @@ package logger
 
 import (
 	"context"
+	stdlog "log"
 	"log/slog"
 	"os"
 	"time"
@@ -34,6 +35,17 @@ func RequestID(ctx context.Context) string {
 		return id
 	}
 	return ""
+}
+
+// StdLogger returns a *log.Logger that funnels into the structured logger at
+// Error level, suitable for http.Server.ErrorLog so server-level errors (TLS
+// handshakes, broken connections) stay in the JSON log stream. Returns nil if
+// the logger has not been initialized.
+func StdLogger() *stdlog.Logger {
+	if log == nil {
+		return nil
+	}
+	return slog.NewLogLogger(log.Handler(), slog.LevelError)
 }
 
 type LogFields map[string]any

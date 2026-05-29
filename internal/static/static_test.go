@@ -1007,6 +1007,68 @@ func TestStatic_CacheRange(t *testing.T) {
 	}
 }
 
+func TestStatic_CacheExpiresAndRefreshes(t *testing.T) {
+	logger.Init()
+
+	dir := t.TempDir()
+	if err := os.WriteFile(dir+"/c.txt", []byte("v1"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	ttl := config.Duration{Duration: 30 * time.Millisecond}
+	h := New(config.Route{Path: "/", StaticDir: dir, StaticCacheTTL: &ttl})
+
+	// Warm the cache.
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/c.txt", nil))
+
+	// Change the file and wait for the TTL to lapse.
+	if err := os.WriteFile(dir+"/c.txt", []byte("v2-updated"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(60 * time.Millisecond)
+
+	resp := httptest.NewRecorder()
+	h.ServeHTTP(resp, httptest.NewRequest("GET", "/c.txt", nil))
+	if body, _ := io.ReadAll(resp.Body); string(body) != "v2-updated" {
+		t.Errorf("after TTL expiry body = %q, want %q (should re-read from disk)", body, "v2-updated")
+	}
+}
+
+func TestStatic_CacheBypassesLargeFiles(t *testing.T) {
+	logger.Init()
+
+	dir := t.TempDir()
+	big := make([]byte, (1<<20)+1024) // > maxCacheFileSize (1 MiB)
+	for i := range big {
+		big[i] = byte('a' + i%26)
+	}
+	if err := os.WriteFile(dir+"/big.bin", big, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	ttl := config.Duration{Duration: time.Hour}
+	h := New(config.Route{Path: "/", StaticDir: dir, StaticCacheTTL: &ttl})
+
+	resp := httptest.NewRecorder()
+	h.ServeHTTP(resp, httptest.NewRequest("GET", "/big.bin", nil))
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.Code)
+	}
+	if body, _ := io.ReadAll(resp.Body); len(body) != len(big) {
+		t.Errorf("served %d bytes, want %d", len(body), len(big))
+	}
+
+	// A large file must NOT be cached: removing it makes the next request 404.
+	if err := os.Remove(dir + "/big.bin"); err != nil {
+		t.Fatal(err)
+	}
+	resp2 := httptest.NewRecorder()
+	h.ServeHTTP(resp2, httptest.NewRequest("GET", "/big.bin", nil))
+	if resp2.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404 (large file should not be cached)", resp2.Code)
+	}
+}
+
 func TestStatic_PrecompressedDisabled(t *testing.T) {
 	logger.Init()
 

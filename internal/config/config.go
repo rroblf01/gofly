@@ -10,19 +10,20 @@ import (
 const DefaultMemoryLimit int64 = 100 << 20 // 100 MB
 
 type Config struct {
-	Port         int        `json:"port"`
-	Workers      int        `json:"workers,omitempty"`
-	ReadTimeout  Duration   `json:"read_timeout,omitempty"`
-	WriteTimeout Duration   `json:"write_timeout,omitempty"`
-	IdleTimeout  Duration   `json:"idle_timeout,omitempty"`
-	MaxBodySize  int64      `json:"max_body_size,omitempty"`
-	RateLimit    *RateLimit `json:"rate_limit,omitempty"`
-	TLS          *TLSConfig `json:"tls,omitempty"`
-	AccessLog    *bool      `json:"access_log,omitempty"`
-	MemoryLimit  int64      `json:"memory_limit,omitempty"`
-	GOGC         int        `json:"gogc,omitempty"`
-	Metrics      *bool      `json:"metrics,omitempty"`
-	Routes       []Route    `json:"routes"`
+	Port              int        `json:"port"`
+	Workers           int        `json:"workers,omitempty"`
+	ReadTimeout       Duration   `json:"read_timeout,omitempty"`
+	WriteTimeout      Duration   `json:"write_timeout,omitempty"`
+	IdleTimeout       Duration   `json:"idle_timeout,omitempty"`
+	MaxBodySize       int64      `json:"max_body_size,omitempty"`
+	RateLimit         *RateLimit `json:"rate_limit,omitempty"`
+	TLS               *TLSConfig `json:"tls,omitempty"`
+	AccessLog         *bool      `json:"access_log,omitempty"`
+	MemoryLimit       int64      `json:"memory_limit,omitempty"`
+	GOGC              int        `json:"gogc,omitempty"`
+	Metrics           *bool      `json:"metrics,omitempty"`
+	TrustForwardedFor *bool      `json:"trust_forwarded_for,omitempty"`
+	Routes            []Route    `json:"routes"`
 }
 
 type RateLimit struct {
@@ -194,6 +195,20 @@ func (c *Config) validate() error {
 		if r.StaticCacheTTL != nil && r.StaticCacheTTL.Duration < 0 {
 			return fmt.Errorf("routes[%d].static_cache_ttl must be non-negative", i)
 		}
+	}
+
+	// Two routes with the same (path, server_name) are ambiguous: the second
+	// would be unreachable and, before the host-aware mux, panicked at startup.
+	seen := make(map[string]int, len(c.Routes))
+	for i, r := range c.Routes {
+		key := r.ServerName + "\x00" + r.Path
+		if first, dup := seen[key]; dup {
+			if r.ServerName == "" {
+				return fmt.Errorf("routes[%d]: duplicate path %q (already defined at routes[%d])", i, r.Path, first)
+			}
+			return fmt.Errorf("routes[%d]: duplicate path %q for server_name %q (already defined at routes[%d])", i, r.Path, r.ServerName, first)
+		}
+		seen[key] = i
 	}
 	return nil
 }

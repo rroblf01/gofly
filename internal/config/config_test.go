@@ -191,6 +191,85 @@ func TestLoad_InvalidStrategy(t *testing.T) {
 	}
 }
 
+func TestConfigDefaults(t *testing.T) {
+	var c Config
+	if !c.MetricsEnabled() {
+		t.Error("MetricsEnabled should default to true")
+	}
+	if c.EffectiveMemoryLimit() != DefaultMemoryLimit {
+		t.Errorf("EffectiveMemoryLimit = %d, want %d", c.EffectiveMemoryLimit(), DefaultMemoryLimit)
+	}
+
+	var r Route
+	if !r.PrecompressedEnabled() {
+		t.Error("PrecompressedEnabled should default to true")
+	}
+	if r.GzipCompressionLevel() != -1 {
+		t.Errorf("GzipCompressionLevel default = %d, want -1", r.GzipCompressionLevel())
+	}
+	if !r.SecurityHeadersDefault() {
+		t.Error("SecurityHeadersDefault should default to true")
+	}
+
+	enabled := true
+	mem := Config{MemoryLimit: 50 << 20}
+	if mem.EffectiveMemoryLimit() != 50<<20 {
+		t.Error("EffectiveMemoryLimit should honor explicit value")
+	}
+	off := false
+	c2 := Config{Metrics: &off}
+	if c2.MetricsEnabled() {
+		t.Error("MetricsEnabled should honor explicit false")
+	}
+	lvl := 9
+	r2 := Route{GzipLevel: &lvl, Precompressed: &enabled}
+	if r2.GzipCompressionLevel() != 9 {
+		t.Error("GzipCompressionLevel should honor explicit value")
+	}
+}
+
+func TestLoad_LeastConnStrategy(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+	data := `{"routes":[{"path":"/","upstreams":["http://localhost:8080"],"strategy":"least_conn"}]}`
+	if err := os.WriteFile(cfgPath, []byte(data), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(cfgPath); err != nil {
+		t.Fatalf("least_conn should be a valid strategy, got: %v", err)
+	}
+}
+
+func TestLoad_DuplicateRoutePath(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+	data := `{"routes":[
+		{"path":"/api","upstreams":["http://a:1"]},
+		{"path":"/api","upstreams":["http://b:2"]}
+	]}`
+	if err := os.WriteFile(cfgPath, []byte(data), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(cfgPath); err == nil {
+		t.Fatal("expected error for duplicate route path, got nil")
+	}
+}
+
+func TestLoad_DuplicatePathDifferentHostsOK(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+	data := `{"routes":[
+		{"path":"/","server_name":"a.com","static_dir":"/tmp"},
+		{"path":"/","server_name":"b.com","static_dir":"/tmp"}
+	]}`
+	if err := os.WriteFile(cfgPath, []byte(data), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(cfgPath); err != nil {
+		t.Fatalf("same path with different server_name should be valid, got: %v", err)
+	}
+}
+
 func TestLoad_NegativeMaxFails(t *testing.T) {
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "config.json")
