@@ -394,38 +394,92 @@ Same static page (`www/index.html`, 798 B), same machine for every row
 
 | Config | Requests/s | Latency (avg) | Memory (RSS) |
 |---|---|---|---|
-| gofly (1 worker, no cache, default GC) | 97,023 | 1.26 ms | **~20 MB** |
-| gofly (×12, no cache, default GC) | 93,240 | 1.31 ms | ~21 MB |
-| gofly (×12, **static_cache_ttl**, default GC) | 87,168 | 1.28 ms | ~21 MB |
-| gofly (×12, **static_cache_ttl**, GOGC=off, GOMEMLIMIT=200MiB) | 95,447 | 1.16 ms | ~93 MB |
-| gofly (×12, **static_cache_ttl**, GOGC=off, **metrics off**) | 97,886 | 1.13 ms | ~93 MB |
-| **nginx alpine** (`worker_processes auto`) | **255,882** | **0.54 ms** | ~58 MB (13 procs) |
+| gofly (1 worker, no cache, default GC) | 90,300 | 1.26 ms | **~22 MB** |
+| gofly (×12, no cache, default GC) | 90,300 | 1.26 ms | ~22 MB |
+| gofly (×12, **static_cache_ttl**, default GC) | 85,700 | 1.35 ms | ~22 MB |
+| gofly (×12, **static_cache_ttl**, GOGC=off, GOMEMLIMIT=200MiB) | 89,400 | 1.18 ms | ~96 MB |
+| gofly (×12, **static_cache_ttl**, GOGC=off, **metrics off**) | 88,800 | 1.18 ms | ~96 MB |
+| **nginx alpine** (`worker_processes auto`) | **209,300** | **0.55 ms** | ~59 MB (13 procs) |
 
-On this hardware gofly tops out around **~99k req/s regardless of worker count,
-static cache, or GC settings** — the limiter is the kernel syscall + loopback
-network path (≈35% `sys`, ≈8% `softirq`, ≈23% idle during the run), not gofly's
-user-space code. That puts it at roughly **38% of nginx's throughput** at about
-**2.3× the latency**. nginx's event-driven core and `sendfile` batching extract
-more from the same kernel path.
+Medians of 3 runs. On a single hot file the cache slightly *lowers* throughput
+(see below), so the fastest — and leanest — config is plain no-cache.
 
-Two caveats on the numbers:
+On a single hot file gofly tops out around **~90k req/s**, roughly **43% of
+nginx's throughput** at about **2× the latency**.
 
-- The `/metrics` wrapper costs only ~2–5% here; set `"metrics": false` for the
-  last few percent.
-- The in-memory cache (`static_cache_ttl`) doesn't move throughput on this
-  workload because an 798 B file already serves from the page cache via
-  `sendfile`. Its win is eliminating the `open`/`stat`/`read` syscalls, which
-  matters under many distinct files or a cold page cache — not a single hot file.
+#### What actually limits it (it is not the kernel, and it is not Go)
+
+An earlier version of this section claimed the ceiling was "the kernel syscall +
+loopback path." That is wrong, and two stdlib reference points on the same
+machine show why:
+
+| Reference server | Requests/s | What it does per request |
+|---|---|---|
+| stock `net/http`, write 5 bytes (no I/O) | **243,000** | one `write()` |
+| stock `http.FileServer` (same 798 B file) | 91,600 | `open`+`fstat`+`sendfile` |
+| gofly (no cache) | 90,300 | `open`+`fstat`+`sendfile` |
+| nginx alpine | 209,300 | cached fd + `sendfile` |
+
+- The loopback path is **not** the wall: a bare Go handler does **243k** on it.
+- Go's `net/http` is **not** the wall either — that 243k *is* `net/http`.
+- The wall is the **per-request `open()` + `fstat()` on the static path**: it
+  drops Go from 243k to ~91k. gofly tracks stock `http.FileServer` almost
+  exactly, so this is the cost of file serving in `net/http`, not gofly's code.
+- nginx is ~2× faster on a hot file because its `open_file_cache` keeps the fd +
+  stat resident, so it pays neither syscall per request — it serves much closer
+  to its own write ceiling.
+
+#### Where the in-memory cache earns its place: many distinct files
+
+`static_cache_ttl` does **not** help a single hot file — an 798 B file already
+serves from the page cache via `sendfile`, and the cache's user-space `Write`
+path is marginally *slower* than `sendfile` there. Its win is eliminating the
+per-request `open`/`fstat`/`read`, which is exactly the limiter above. Across
+1000 distinct files hit at random (`wrk` + a random-path Lua script):
+
+| Config | Single hot file | 1000 files (random) |
+|---|---|---|
+| gofly (no cache) | 90,300 | 106,800 |
+| gofly (**static_cache_ttl**) | 85,700 | **183,100** |
+| nginx alpine | 209,300 | 240,900 |
+
+With the cache, gofly reaches **~76% of nginx** on the many-files workload
+(vs ~43% on a single file). The cache hot path is allocation-lean — 18 allocs and
+~2.2 µs per hit, with `Last-Modified`/`Content-Length` precomputed at insertion
+so nothing is reformatted per request (see `serveCached` in
+`internal/static/static.go`, guarded by `BenchmarkCacheHit`).
+
+**Rule of thumb:** enable `static_cache_ttl` for many small files or a cold page
+cache; leave it off for a handful of hot files served by `sendfile`.
+
+The `/metrics` wrapper costs ~2–5%; set `"metrics": false` for the last few percent.
+
+#### Why gofly does not match nginx's `open_file_cache` on a hot file
+
+Closing the single-file gap would mean caching the open fd and `sendfile`-ing it
+with an explicit offset, the way nginx does. In pure-stdlib Go that is not clean:
+`(*os.File).ReadFrom`/`sendfile` advances the shared file offset, so one cached
+fd cannot be `sendfile`d concurrently without racing; a `SectionReader` (`pread`,
+offset-explicit) sidesteps the race but is no longer an `*os.File`, so `net/http`
+stops using `sendfile` and falls back to a user-space copy — the same path the
+in-memory cache already takes. A `syscall.Sendfile` with an explicit offset would
+work but needs the connection's raw fd, which `net/http` deliberately hides
+behind `Hijacker` — taking it over means hand-rolling HTTP write/keep-alive.
+gofly keeps the stdlib server (and its zero-dependency, memory-safe footprint)
+and uses the in-memory cache instead, which wins on the workload that the
+per-request syscalls actually hurt.
 
 ### Comparison with nginx
 
-Best gofly config (×12 workers, `static_cache_ttl`, GOGC=off + GOMEMLIMIT=200MiB, metrics off) vs nginx alpine, same machine:
+Fastest single-file gofly config (×12 workers, no cache, default GC — also the
+leanest) vs nginx alpine, same machine:
 
 | Metric | gofly (scratch) | nginx (alpine) | Difference |
 |---|---|---|---|
-| **Requests/sec** | 97,886 | 255,882 | **-62%** |
-| **Latency (avg)** | 1.13 ms | **0.54 ms** | **+109%** |
-| **RSS under load (default GC)** | **~20 MB** | ~58 MB (13 procs) | **~3× smaller** 🏆 |
+| **Requests/sec** (single hot file) | 90,300 | 209,300 | **-57%** |
+| **Requests/sec** (1000 files, cache on) | 183,100 | 240,900 | **-24%** |
+| **Latency (avg)** | 1.26 ms | **0.55 ms** | **+129%** |
+| **RSS under load (default GC)** | **~22 MB** | ~59 MB (13 procs) | **~2.7× smaller** 🏆 |
 | **Image size** | **~7 MB** | ~35 MB | **5× smaller** 🏆 |
 | **Dependencies** | **0** (pure stdlib) | libc, PCRE, zlib, OpenSSL | **—** 🏆 |
 | **Static binary** | ✅ Yes | ❌ No | **—** 🏆 |

@@ -81,7 +81,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	if h.cache != nil {
 		if e, ok := h.cache.get(target); ok {
-			h.serveContent(w, r, bytes.NewReader(e.data), int64(len(e.data)), e.modTime, e.etag, e.ctype)
+			h.serveCached(w, r, e)
 			return
 		}
 	}
@@ -200,10 +200,12 @@ func (h *Handler) serveAndMaybeCache(w http.ResponseWriter, r *http.Request, f *
 		modTime: stat.ModTime(),
 		etag:    etagFor(stat),
 		ctype:   ctype,
+		lastMod: stat.ModTime().UTC().Format(http.TimeFormat),
+		sizeStr: strconv.FormatInt(int64(len(data)), 10),
 		data:    data,
 	}
 	h.cache.put(origName, e)
-	h.serveContent(w, r, bytes.NewReader(data), int64(len(data)), e.modTime, e.etag, e.ctype)
+	h.serveCached(w, r, e)
 }
 
 // etagFor builds the `"<hexmod>-<hexsize>"` validator without fmt/reflection.
@@ -289,6 +291,64 @@ func (h *Handler) serveContent(w http.ResponseWriter, r *http.Request, src io.Re
 
 	w.WriteHeader(http.StatusOK)
 	writeBody(w, src)
+}
+
+// serveCached is the in-memory cache hot path. Everything it emits is either a
+// constant or precomputed on the entry, so per request it does only the
+// conditional-request checks, a fixed set of header-map writes, and a single
+// w.Write of the cached bytes — no time formatting, no length formatting, no
+// content sniff, no reader/seeker indirection. For a small hot file this is what
+// lets the cache beat the open+fstat+sendfile path instead of trailing it.
+func (h *Handler) serveCached(w http.ResponseWriter, r *http.Request, e *cacheEntry) {
+	if match := r.Header.Get("If-None-Match"); match != "" {
+		if match == e.etag || match == "*" {
+			h.write304(w, e.etag, e.lastMod)
+			return
+		}
+	}
+	if ims := r.Header.Get("If-Modified-Since"); ims != "" {
+		if t, err := time.Parse(http.TimeFormat, ims); err == nil && !e.modTime.After(t) {
+			h.write304(w, e.etag, e.lastMod)
+			return
+		}
+	}
+
+	if rangeHdr := r.Header.Get("Range"); rangeHdr != "" && strings.HasPrefix(rangeHdr, "bytes=") {
+		if h.serveRange(w, r, bytes.NewReader(e.data), int64(len(e.data)), e.ctype, e.etag, e.lastMod) {
+			return
+		}
+	}
+
+	hdr := w.Header()
+	hdr["Content-Type"] = []string{e.ctype}
+	hdr["Content-Length"] = []string{e.sizeStr}
+	hdr["Etag"] = []string{e.etag}
+	hdr["Last-Modified"] = []string{e.lastMod}
+	hdr["Accept-Ranges"] = []string{"bytes"}
+	if h.cacheTTL != "" {
+		hdr["Cache-Control"] = []string{h.cacheTTL}
+	}
+	if h.secHeaders {
+		hdr["X-Content-Type-Options"] = []string{"nosniff"}
+		hdr["X-Frame-Options"] = []string{"DENY"}
+		hdr["Referrer-Policy"] = []string{"strict-origin-when-cross-origin"}
+	}
+	for k, v := range h.setHeaders {
+		hdr[http.CanonicalHeaderKey(k)] = []string{v}
+	}
+
+	w.WriteHeader(http.StatusOK)
+	w.Write(e.data)
+}
+
+func (h *Handler) write304(w http.ResponseWriter, etag, lastMod string) {
+	hdr := w.Header()
+	hdr["Etag"] = []string{etag}
+	hdr["Last-Modified"] = []string{lastMod}
+	if h.cacheTTL != "" {
+		hdr["Cache-Control"] = []string{h.cacheTTL}
+	}
+	w.WriteHeader(http.StatusNotModified)
 }
 
 func writeBody(w http.ResponseWriter, src io.ReadSeeker) {
@@ -497,11 +557,16 @@ type gzipFile struct {
 }
 
 // cacheEntry is a fully resolved small file held in memory by the optional
-// static cache: its bytes plus everything serveContent needs to emit headers.
+// static cache: its bytes plus everything serveCached needs to emit headers.
+// lastMod and sizeStr are precomputed at insertion so the hot read path never
+// reformats the time or the length per request — that per-request formatting was
+// what made the cached path slower than the sendfile path it replaced.
 type cacheEntry struct {
 	modTime time.Time
 	etag    string
 	ctype   string
+	lastMod string
+	sizeStr string
 	data    []byte
 }
 
