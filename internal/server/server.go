@@ -455,8 +455,10 @@ func vhostDispatcher(entries []vhostEntry) http.Handler {
 // hostMatches compares a configured server_name against a request Host header,
 // ignoring any port and case.
 func hostMatches(serverName, host string) bool {
-	if h, _, err := net.SplitHostPort(host); err == nil {
-		host = h
+	if strings.IndexByte(host, ':') >= 0 {
+		if h, _, err := net.SplitHostPort(host); err == nil {
+			host = h
+		}
 	}
 	return strings.EqualFold(host, serverName)
 }
@@ -930,7 +932,13 @@ func (g *gzipResponseWriter) finish() {
 // gzipMiddleware keeps the historical single-argument signature (default level,
 // no minimum length) for callers and tests that don't need tuning.
 func gzipMiddleware(next http.Handler) http.Handler {
-	return gzipMiddlewareWith(next, -1, 0)
+	return 	gzipMiddlewareWith(next, -1, 0)
+}
+
+var gzipRWPool = sync.Pool{
+	New: func() any {
+		return &gzipResponseWriter{}
+	},
 }
 
 func gzipMiddlewareWith(next http.Handler, level, minLength int) http.Handler {
@@ -939,8 +947,18 @@ func gzipMiddlewareWith(next http.Handler, level, minLength int) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		grw := &gzipResponseWriter{ResponseWriter: w, level: level, minLength: minLength}
+		grw := gzipRWPool.Get().(*gzipResponseWriter)
+		grw.ResponseWriter = w
+		grw.level = level
+		grw.minLength = minLength
+		grw.status = 0
+		grw.buf = nil
+		grw.gw = nil
+		grw.gzipOn = false
+		grw.wroteHeader = false
 		next.ServeHTTP(grw, r)
 		grw.finish()
+		grw.ResponseWriter = nil
+		gzipRWPool.Put(grw)
 	})
 }

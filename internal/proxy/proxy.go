@@ -78,15 +78,6 @@ var DefaultTransport = newTransport(0)
 // N routes sharing a timeout share one connection pool instead of allocating N.
 var timeoutTransports sync.Map // time.Duration -> *http.Transport
 
-// proxyBufPool recycles the 32 KiB relay buffers used for copying response
-// bodies in the proxy hot path, avoiding an allocation per request.
-var proxyBufPool = sync.Pool{
-	New: func() any {
-		b := make([]byte, 32*1024)
-		return &b
-	},
-}
-
 // wsBufPool recycles the 32 KiB relay buffers used to shuttle bytes between the
 // client and upstream on hijacked WebSocket connections, so long-lived
 // connections don't each pin two fresh buffers.
@@ -97,25 +88,23 @@ var wsBufPool = sync.Pool{
 	},
 }
 
-var hopByHopHeaders = []string{
-	"Connection",
-	"Keep-Alive",
-	"Proxy-Connection",
-	"Proxy-Authenticate",
-	"Proxy-Authorization",
-	"Te",
-	"Trailer",
-	"Transfer-Encoding",
-	"Upgrade",
+// hopByHopSet contains headers that must not be forwarded per RFC 7230.
+// All keys are canonicalised so we use exact map lookup instead of EqualFold.
+var hopByHopSet = map[string]struct{}{
+	"Connection":        {},
+	"Keep-Alive":        {},
+	"Proxy-Connection":  {},
+	"Proxy-Authenticate": {},
+	"Proxy-Authorization": {},
+	"Te":                {},
+	"Trailer":           {},
+	"Transfer-Encoding": {},
+	"Upgrade":           {},
 }
 
 func isHopByHop(k string) bool {
-	for _, h := range hopByHopHeaders {
-		if strings.EqualFold(k, h) {
-			return true
-		}
-	}
-	return false
+	_, ok := hopByHopSet[k]
+	return ok
 }
 
 func removeConnectionHeaders(h http.Header) {
@@ -294,7 +283,7 @@ func (p *Proxy) serveHTTP(w http.ResponseWriter, r *http.Request, up *UpstreamSt
 		p.applyDirector(out)
 
 		removeConnectionHeaders(out.Header)
-		for _, h := range hopByHopHeaders {
+		for h := range hopByHopSet {
 			out.Header.Del(h)
 		}
 
@@ -330,9 +319,9 @@ func (p *Proxy) serveHTTP(w http.ResponseWriter, r *http.Request, up *UpstreamSt
 		removeConnectionHeaders(w.Header())
 
 		w.WriteHeader(resp.StatusCode)
-		buf := proxyBufPool.Get().(*[]byte)
-		io.CopyBuffer(w, resp.Body, *buf)
-		proxyBufPool.Put(buf)
+		// io.Copy detects WriterTo on http.Response.Body (Go 1.20+) and may
+		// use splice(2) for zero-copy TCP forwarding on Linux.
+		io.Copy(w, resp.Body)
 		return
 	}
 }
@@ -486,9 +475,17 @@ func (p *Proxy) runHealthChecks() {
 	}
 }
 
+func headerValue(h http.Header, key string) string {
+	v := h[key]
+	if len(v) == 0 {
+		return ""
+	}
+	return v[0]
+}
+
 func isWebSocket(r *http.Request) bool {
-	return strings.EqualFold(r.Header.Get("Connection"), "Upgrade") &&
-		strings.EqualFold(r.Header.Get("Upgrade"), "websocket")
+	return strings.EqualFold(headerValue(r.Header, "Connection"), "Upgrade") &&
+		strings.EqualFold(headerValue(r.Header, "Upgrade"), "websocket")
 }
 
 func (p *Proxy) serveWebSocket(w http.ResponseWriter, r *http.Request, target *url.URL) {
