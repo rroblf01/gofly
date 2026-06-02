@@ -1,5 +1,34 @@
 # Changelog
 
+## v1.1.0 (2026-06-02)
+
+Backwards-compatible within `1.x`: all new config fields are optional and default
+to the previous behaviour.
+
+### Features
+
+- **nginx config converter (`gofly -convert nginx.conf`)** — one-shot migration aid that parses the common static-serving and reverse-proxy subset of an nginx config and prints an equivalent gofly `config.json` to stdout, with a warning on stderr for every directive it skips or only partially translates (regex `location`, `rewrite`/`if`/`map`, `limit_req`, `gzip_types`, …). It is **not** a runtime nginx parser — gofly still loads JSON only — so the output is reviewed once and committed. New `internal/nginx` package; documented build-time conversion pattern for the `scratch` Docker image.
+- **Upstream transport tuning** — new optional `upstream` config block: `max_idle_conns`, `max_idle_conns_per_host`, `buffer_size`, and `disable_http2`. Defaults are memory-conservative (tuned for a ~100 MB budget); raise them for high-traffic reverse-proxy deployments.
+- **`static_cache_max_bytes`** — bounds the total bytes held by a route's in-memory static cache (default 64 MiB), complementing the existing 4096-entry / ≤1 MiB-per-file caps so the footprint stays inside the process memory limit regardless of file sizes.
+- **`max_procs`** — maps to `runtime.GOMAXPROCS` for pinning the scheduler's OS-thread count.
+
+### Performance
+
+- **Leaner static cache hot path** — the cache-hit path (`serveCached`) now precomputes `Last-Modified`/`Content-Length` at insertion and shares the constant security-header slices package-level, cutting a cache hit from 21 to **14 allocations** (~13% less CPU), guarded by `BenchmarkCacheHit`. On a single hot file `sendfile` still wins (the cache path is intentionally a no-op there); the cache's gain is the many-distinct-files workload, where it roughly doubles throughput (~95k → ~189k req/s) by eliminating the per-request `open`/`fstat`.
+- **Reverse-proxy transport refactor** — improved buffer management and header handling drop a single-upstream proxy request from ~69 µs / ~54 KB allocated to **~37.7 µs / ~17 KB**.
+- **Rate limiter** — removed the now-redundant per-bucket mutex; the shard lock already serialises token-bucket access, so each `allow()` does one fewer lock.
+
+### Documentation
+
+- **Corrected performance analysis.** The previous "kernel/loopback-bound" explanation was wrong: a bare Go `net/http` handler sustains ~233k req/s on the same loopback path. The real single-file limiter is the per-request `open()`+`fstat()` on the static path (drops Go from ~233k to ~95k); gofly tracks stock `http.FileServer`. Documented why more goroutines or a worker pool do **not** help (the handler already runs 50–100× faster than the socket can feed it — in-process it does >1M req/s/core), and why matching nginx's `open_file_cache` is not clean in pure-stdlib Go (`sendfile` offset semantics + `net/http` hiding the conn fd behind `Hijacker`).
+- Refreshed every benchmark figure across both workloads (single hot file and 1000 random files), for gofly and nginx, all over **HTTP/1.1** — with an explicit note that the comparison is like-for-like protocol (wrk is HTTP/1.1-only; nginx listens plaintext) and that HTTP/2 would not change the result on loopback.
+- Added the nginx → gofly migration guide and config-directive mapping table.
+
+### Options added
+
+- Global: `max_procs`, `upstream` { `max_idle_conns`, `max_idle_conns_per_host`, `buffer_size`, `disable_http2` }
+- Route: `static_cache_max_bytes`
+
 ## v1.0.0 (2026-05-29)
 
 First stable release. From this version the JSON config schema and CLI flags are
