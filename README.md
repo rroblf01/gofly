@@ -648,13 +648,13 @@ Full client→server→loopback round trips via `httptest`, AMD Ryzen 5 3600
 
 | Benchmark | Latency | Allocs/op | Bytes/op |
 |---|---|---|---|
-| Reverse proxy (single upstream) | 69.0 µs | 165 | 54,346 |
-| Reverse proxy (3 upstreams, round-robin) | 70.2 µs | 164 | 54,581 |
-| Static file (small, 13 B) | 32.1 µs | 119 | 15,741 |
-| Static file (large, 256 KB) | 52.9 µs | 120 | 18,701 |
-| Proxy throughput (sequential) | 132.8 µs | 148 | 46,035 |
-| Real-world page (HTML+CSS+JS) | 84.6 µs | 100 | 8,357 |
-| **Heap alloc per request** | — | — | **8.1 B/req** |
+| Reverse proxy (single upstream) | 37.7 µs | 152 | 17,018 |
+| Reverse proxy (3 upstreams, round-robin) | 33.6 µs | 151 | 17,921 |
+| Static file (small, 13 B) | 34.6 µs | 114 | 15,101 |
+| Static file (large, 256 KB) | 57.1 µs | 114 | 17,597 |
+| Proxy throughput (sequential) | 136.4 µs | 141 | 14,326 |
+| Real-world page (HTML+CSS+JS) | 90.3 µs | 96 | 8,290 |
+| **Heap alloc per request** | — | — | **27.8 B/req** |
 
 > Note: Parallel benchmarks use `RunParallel` and auto-scale to GOMAXPROCS (12 threads).
 
