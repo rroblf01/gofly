@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.1.1 (2026-06-02)
+
+### Fixes
+
+- **Pre-compressed static serving omitted `Content-Encoding`** — a route serving a `.gz` sibling (`precompressed`, on by default) returned the compressed bytes with the identity `Content-Type` and **no `Content-Encoding: gzip`**, so clients rendered raw gzip as text (garbage output). The pre-compressed path now sets `Content-Encoding: gzip` and `Vary: Accept-Encoding`; a request that does not accept gzip still gets the identity file. In addition, the gzip middleware no longer re-compresses a response that already declares a `Content-Encoding`, so enabling both `gzip` and `precompressed` on the same route can no longer double-encode the body. Regression tests added for both paths.
+
 ## v1.1.0 (2026-06-02)
 
 Backwards-compatible within `1.x`: all new config fields are optional and default

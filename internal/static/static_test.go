@@ -919,6 +919,44 @@ func TestStatic_GzipPrecompressed(t *testing.T) {
 	if string(body) != "gzipped content" {
 		t.Errorf("body = %q, want %q (pre-compressed .gz should be served)", string(body), "gzipped content")
 	}
+	// The body is gzip bytes, so the response MUST declare the encoding (and vary
+	// on it) or the client renders the raw .gz as text.
+	if ce := resp.Header().Get("Content-Encoding"); ce != "gzip" {
+		t.Errorf("Content-Encoding = %q, want %q", ce, "gzip")
+	}
+	if v := resp.Header().Get("Vary"); v != "Accept-Encoding" {
+		t.Errorf("Vary = %q, want %q", v, "Accept-Encoding")
+	}
+	// Content-Type stays the identity type, derived from the original name.
+	if ct := resp.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/plain") {
+		t.Errorf("Content-Type = %q, want text/plain*", ct)
+	}
+}
+
+// TestStatic_PrecompressedIdentityWhenNoGzipAccept verifies that a client that
+// does not accept gzip gets the identity file with no Content-Encoding.
+func TestStatic_PrecompressedIdentityWhenNoGzipAccept(t *testing.T) {
+	logger.Init()
+	dir := t.TempDir()
+	if err := os.WriteFile(dir+"/test.txt", []byte("original content"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dir+"/test.txt.gz", []byte("gzipped content"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	h := New(config.Route{Path: "/", StaticDir: dir})
+
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/test.txt", nil) // no Accept-Encoding
+	h.ServeHTTP(resp, req)
+
+	if ce := resp.Header().Get("Content-Encoding"); ce != "" {
+		t.Errorf("Content-Encoding = %q, want empty (identity)", ce)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "original content" {
+		t.Errorf("body = %q, want identity %q", string(body), "original content")
+	}
 }
 
 func TestStatic_CacheServesFromMemory(t *testing.T) {

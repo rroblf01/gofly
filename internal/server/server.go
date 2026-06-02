@@ -870,13 +870,21 @@ func (g *gzipResponseWriter) WriteHeader(code int) {
 		return
 	}
 	g.status = code
-	if bodyless(code) {
+	if bodyless(code) || g.alreadyEncoded() {
 		g.commitPlain()
 		return
 	}
 	if g.minLength <= 0 {
 		g.commitGzip()
 	}
+}
+
+// alreadyEncoded reports whether the wrapped handler set its own
+// Content-Encoding (e.g. the static handler serving a pre-compressed .gz). In
+// that case the middleware must pass the body through untouched rather than
+// gzip it a second time.
+func (g *gzipResponseWriter) alreadyEncoded() bool {
+	return g.Header().Get("Content-Encoding") != ""
 }
 
 func (g *gzipResponseWriter) Write(b []byte) (int, error) {
@@ -887,6 +895,10 @@ func (g *gzipResponseWriter) Write(b []byte) (int, error) {
 		if g.gzipOn {
 			return g.gw.Write(b)
 		}
+		return g.ResponseWriter.Write(b)
+	}
+	if g.alreadyEncoded() {
+		g.commitPlain()
 		return g.ResponseWriter.Write(b)
 	}
 	if g.minLength <= 0 {

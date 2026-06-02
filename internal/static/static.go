@@ -25,10 +25,12 @@ var (
 		},
 	}
 
-	nosniffHeader      = []string{"nosniff"}
-	denyFrameHeader    = []string{"DENY"}
-	referrerHeader     = []string{"strict-origin-when-cross-origin"}
-	acceptRangesHeader = []string{"bytes"}
+	nosniffHeader        = []string{"nosniff"}
+	denyFrameHeader      = []string{"DENY"}
+	referrerHeader       = []string{"strict-origin-when-cross-origin"}
+	acceptRangesHeader   = []string{"bytes"}
+	gzipEncodingHeader   = []string{"gzip"}
+	acceptEncodingHeader = []string{"Accept-Encoding"}
 )
 
 type Handler struct {
@@ -164,6 +166,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if h.precompressed {
 			if gz, ok := precompressedGzip(r, target); ok {
 				defer gz.f.Close()
+				// The body is the .gz file's bytes, so the response must declare
+				// the encoding (and Content-Type comes from the original name, not
+				// ".gz"). Without Content-Encoding the client receives raw gzip
+				// labelled as the identity type and renders garbage.
+				hdr := w.Header()
+				hdr["Content-Encoding"] = gzipEncodingHeader
+				hdr["Vary"] = acceptEncodingHeader
 				h.serveFile(w, r, gz.f, gz.stat, gz.orig)
 				return
 			}

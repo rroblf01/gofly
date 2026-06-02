@@ -349,6 +349,28 @@ func TestGzipMiddleware(t *testing.T) {
 			t.Errorf("body = %q, want %q", rec.Body.String(), "hello world")
 		}
 	})
+
+	// A handler that already set Content-Encoding (e.g. the static handler serving
+	// a pre-compressed .gz) must pass through untouched — not be gzipped a second
+	// time, which would double-encode the body and render garbage on the client.
+	t.Run("does not double-encode pre-compressed body", func(t *testing.T) {
+		preGz := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Encoding", "gzip")
+			w.Write([]byte("already-gzip-bytes"))
+		})
+		h := gzipMiddleware(preGz)
+		req := httptest.NewRequest("GET", "/", nil)
+		req.Header.Set("Accept-Encoding", "gzip")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+
+		if got := rec.Header().Values("Content-Encoding"); len(got) != 1 || got[0] != "gzip" {
+			t.Errorf("Content-Encoding = %v, want single [gzip]", got)
+		}
+		if rec.Body.String() != "already-gzip-bytes" {
+			t.Errorf("body = %q, want passthrough %q", rec.Body.String(), "already-gzip-bytes")
+		}
+	})
 }
 
 func TestServer_MetricsEndpoint(t *testing.T) {
