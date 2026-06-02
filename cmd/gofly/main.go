@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"net"
@@ -10,6 +11,7 @@ import (
 	"github.com/rroblf01/gofly/internal/config"
 	"github.com/rroblf01/gofly/internal/logger"
 	"github.com/rroblf01/gofly/internal/metrics"
+	"github.com/rroblf01/gofly/internal/nginx"
 	"github.com/rroblf01/gofly/internal/server"
 )
 
@@ -25,10 +27,19 @@ func main() {
 	root := flag.String("root", "", "serve static files from this directory (configless mode)")
 	healthCheck := flag.Bool("health", false, "perform health check against running server")
 	testConfig := flag.Bool("t", false, "test configuration: load and validate, then exit")
+	convert := flag.String("convert", "", "convert an nginx config file to gofly JSON on stdout, then exit")
 	flag.Parse()
 
 	if *showVersion {
 		fmt.Println("gofly " + version)
+		return
+	}
+
+	if *convert != "" {
+		if err := runConvert(*convert); err != nil {
+			fmt.Fprintln(os.Stderr, "gofly: convert failed: "+err.Error())
+			os.Exit(1)
+		}
 		return
 	}
 
@@ -117,4 +128,36 @@ func main() {
 		})
 		os.Exit(1)
 	}
+}
+
+// runConvert reads an nginx config file, converts the supported subset to gofly
+// JSON on stdout, and prints every skipped/partial directive as a warning on
+// stderr so the operator can review the result before using it. Warnings do not
+// fail the conversion; only an unreadable file or a parse error does.
+func runConvert(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	cfg, warnings, err := nginx.Convert(f)
+	if err != nil {
+		return err
+	}
+
+	out, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+	fmt.Println(string(out))
+
+	if len(warnings) > 0 {
+		fmt.Fprintf(os.Stderr, "\ngofly: %d warning(s) converting %s:\n", len(warnings), path)
+		for _, w := range warnings {
+			fmt.Fprintln(os.Stderr, "  WARN "+w)
+		}
+		fmt.Fprintln(os.Stderr, "\nReview the JSON above before use; validate with: gofly -t -config <file>")
+	}
+	return nil
 }

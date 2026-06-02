@@ -240,6 +240,7 @@ The following variables are expanded in `set_headers`, `host`, and `rewrite`:
 | `-root <dir>` | Configless mode: serve a static directory, no config file needed |
 | `-port <n>` | Override the listen port |
 | `-t` | Test (load + validate) the configuration and exit; non-zero on error |
+| `-convert <nginx.conf>` | Convert a subset of an nginx config to gofly JSON on stdout (warnings on stderr), then exit |
 | `-debug` | Enable debug-level logging |
 | `-version` | Print the build version and exit |
 | `-health` | Perform a TCP health check against a running instance (used by Docker `HEALTHCHECK`) |
@@ -248,6 +249,31 @@ The following variables are expanded in `set_headers`, `host`, and `rewrite`:
 gofly -t -config /etc/gofly/config.json   # validate before deploy/reload
 gofly -version                            # e.g. "gofly v1.0.0"
 ```
+
+### Migrating from nginx (`-convert`)
+
+`-convert` is a one-shot migration aid: it parses the common static-serving and
+reverse-proxy subset of an nginx config and prints an equivalent gofly
+`config.json` to **stdout**, with a warning on **stderr** for every directive it
+skipped or only partially translated. It is *not* a runtime nginx parser — gofly
+still loads JSON only — so you review the output once and commit it.
+
+```bash
+gofly -convert /etc/nginx/nginx.conf > config.json   # JSON on stdout, warnings on stderr
+gofly -t -config config.json                         # then validate the result
+```
+
+**Translated:** `listen` (port + `ssl`), `server_name`, `root`, `location`
+(prefix, `=`, `^~`), `try_files …/index.html` → `spa`, `proxy_pass` +
+`upstream` blocks (incl. `least_conn`), `add_header`/`proxy_set_header` →
+`set_headers`, `expires` → `browser_cache_ttl`, `gzip`/`gzip_min_length`/
+`gzip_comp_level`, and `ssl_certificate`/`ssl_certificate_key` → `tls`.
+
+**Not translated (warned, not silently dropped):** regex `location ~`/`~*`
+(gofly is prefix-only), `rewrite`/`return`, `if`, `map`, `limit_req`, `gzip_types`
+(gofly gzips by size, not MIME type), and any directive outside the supported
+set. Review every warning — the converted route set may need hand-editing where
+nginx used a feature gofly does not have.
 
 ## API
 
