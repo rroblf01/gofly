@@ -469,6 +469,53 @@ gofly keeps the stdlib server (and its zero-dependency, memory-safe footprint)
 and uses the in-memory cache instead, which wins on the workload that the
 per-request syscalls actually hurt.
 
+#### The handler is not the bottleneck — so pools / more goroutines do not help
+
+A natural instinct is to chase the nginx gap with more concurrency: a goroutine
+worker pool, more workers, a bigger accept fan-out. Measured in-process
+(`go test -bench`, `RunParallel`, 12 cores), the cache-hit handler costs:
+
+| In-process cache hit | ns/op | ≈ throughput |
+|---|---|---|
+| 1 file (one hot key) | ~1,145 | ~870k req/s/core |
+| 1000 files (spread) | ~845 | ~1.18M req/s/core |
+
+The handler sustains **over a million requests per second per core** in
+user-space, yet the socket-level load test tops out at 85k–183k req/s *total*.
+gofly's own code runs **50–100× faster than the requests it receives over a
+socket** — it is nowhere near the bottleneck. Conclusions:
+
+- **A worker pool would slow things down.** Go's runtime is already an M:N
+  scheduler (a goroutine pool over `GOMAXPROCS` OS threads) and `net/http` is
+  already goroutine-per-connection. Adding a second pool on top only adds a queue
+  and a hand-off.
+- **More workers/goroutines do nothing.** 1 vs 12 `workers` (SO_REUSEPORT) measured
+  identically (~90k). With 100 client connections there are already 100 handler
+  goroutines; adding more than there are connections changes nothing.
+- **Micro-optimising the handler does nothing for throughput either** — there is
+  50–100× of headroom. (It still helps *allocations*; see below.)
+
+The real wall is the **per-request socket + syscall path of `net/http`**
+(accept → read/parse request → write response → `sendfile`/`write` → loopback),
+against nginx's hand-tuned epoll event loop + cached fds + `tcp_nopush`. That is
+an architectural difference in the HTTP server, not something a pool fixes.
+Closing it would require either the raw-`sendfile`-with-hijack route rejected
+above, or replacing `net/http` with a custom epoll server — which would discard
+the zero-dependency, memory-safe, simple design that is the point of gofly.
+
+#### The one low-cost lever: fewer allocations, not more goroutines
+
+The only user-space win that matters is cutting per-request allocations: fewer
+allocations let a *tighter* GC (`GOGC`) hit the same throughput at lower RSS, or
+the same RSS with less GC CPU — which is the trade-off that actually concerns a
+memory-budgeted deployment. That is why the cache hot path
+(`serveCached`) precomputes `Last-Modified`/`Content-Length` at insertion and
+writes the body directly instead of going through a reader (18 vs 21 allocs/hit,
+guarded by `BenchmarkCacheHit`). Beyond that the handler already allocates little;
+most remaining per-request allocations live inside `net/http` and are not
+reachable without leaving the stdlib server. Diminishing returns — so gofly stops
+here rather than trading its footprint and simplicity for a few percent.
+
 ### Comparison with nginx
 
 Fastest single-file gofly config (×12 workers, no cache, default GC — also the
