@@ -9,6 +9,19 @@ import (
 
 const DefaultMemoryLimit int64 = 100 << 20 // 100 MB
 
+// Memory-conservative defaults for the shared upstream transport. Tuned for a
+// small (~100 MB) memory budget rather than maximum throughput; raise via the
+// `upstream` config block on high-traffic deployments.
+const (
+	DefaultUpstreamMaxIdleConns        = 256
+	DefaultUpstreamMaxIdleConnsPerHost = 64
+	DefaultUpstreamBufferSize          = 32 << 10 // 32 KiB
+)
+
+// DefaultStaticCacheMaxBytes bounds the total bytes held by an in-memory static
+// cache when static_cache_max_bytes is unset.
+const DefaultStaticCacheMaxBytes int64 = 64 << 20 // 64 MiB
+
 type Config struct {
 	Port              int        `json:"port"`
 	Workers           int        `json:"workers,omitempty"`
@@ -23,7 +36,22 @@ type Config struct {
 	GOGC              int        `json:"gogc,omitempty"`
 	Metrics           *bool      `json:"metrics,omitempty"`
 	TrustForwardedFor *bool      `json:"trust_forwarded_for,omitempty"`
+	MaxProcs          int        `json:"max_procs,omitempty"`
+	Upstream          *Upstream  `json:"upstream,omitempty"`
 	Routes            []Route    `json:"routes"`
+}
+
+// Upstream tunes the shared HTTP transport used for every proxy route. Smaller
+// values lower the resident memory of idle connection pools at the cost of less
+// connection reuse. All fields are optional and fall back to memory-conservative
+// defaults (see DefaultUpstream*).
+type Upstream struct {
+	MaxIdleConns        int `json:"max_idle_conns,omitempty"`
+	MaxIdleConnsPerHost int `json:"max_idle_conns_per_host,omitempty"`
+	// BufferSize is the read/write buffer size in bytes per connection. Each
+	// idle connection pins roughly 2×BufferSize, so this is the dominant knob
+	// for transport memory under many idle upstreams.
+	BufferSize int `json:"buffer_size,omitempty"`
 }
 
 type RateLimit struct {
@@ -65,6 +93,7 @@ type Route struct {
 	ErrorPages          map[int]string    `json:"error_pages,omitempty"`
 	SecurityHeaders     *bool             `json:"security_headers,omitempty"`
 	StaticCacheTTL      *Duration         `json:"static_cache_ttl,omitempty"`
+	StaticCacheMaxBytes int64             `json:"static_cache_max_bytes,omitempty"`
 	Precompressed       *bool             `json:"precompressed,omitempty"`
 }
 
@@ -195,6 +224,24 @@ func (c *Config) validate() error {
 		if r.StaticCacheTTL != nil && r.StaticCacheTTL.Duration < 0 {
 			return fmt.Errorf("routes[%d].static_cache_ttl must be non-negative", i)
 		}
+		if r.StaticCacheMaxBytes < 0 {
+			return fmt.Errorf("routes[%d].static_cache_max_bytes must be non-negative", i)
+		}
+	}
+
+	if c.MaxProcs < 0 {
+		return fmt.Errorf("max_procs must be non-negative")
+	}
+	if c.Upstream != nil {
+		if c.Upstream.MaxIdleConns < 0 {
+			return fmt.Errorf("upstream.max_idle_conns must be non-negative")
+		}
+		if c.Upstream.MaxIdleConnsPerHost < 0 {
+			return fmt.Errorf("upstream.max_idle_conns_per_host must be non-negative")
+		}
+		if c.Upstream.BufferSize < 0 {
+			return fmt.Errorf("upstream.buffer_size must be non-negative")
+		}
 	}
 
 	// Two routes with the same (path, server_name) are ambiguous: the second
@@ -265,4 +312,32 @@ func (r *Route) GzipCompressionLevel() int {
 		return *r.GzipLevel
 	}
 	return -1
+}
+
+// EffectiveStaticCacheMaxBytes returns the byte budget for this route's
+// in-memory static cache, falling back to DefaultStaticCacheMaxBytes.
+func (r *Route) EffectiveStaticCacheMaxBytes() int64 {
+	if r.StaticCacheMaxBytes > 0 {
+		return r.StaticCacheMaxBytes
+	}
+	return DefaultStaticCacheMaxBytes
+}
+
+// EffectiveUpstream resolves the transport tuning knobs, applying
+// memory-conservative defaults for any field left at zero.
+func (c *Config) EffectiveUpstream() Upstream {
+	u := Upstream{}
+	if c.Upstream != nil {
+		u = *c.Upstream
+	}
+	if u.MaxIdleConns <= 0 {
+		u.MaxIdleConns = DefaultUpstreamMaxIdleConns
+	}
+	if u.MaxIdleConnsPerHost <= 0 {
+		u.MaxIdleConnsPerHost = DefaultUpstreamMaxIdleConnsPerHost
+	}
+	if u.BufferSize <= 0 {
+		u.BufferSize = DefaultUpstreamBufferSize
+	}
+	return u
 }

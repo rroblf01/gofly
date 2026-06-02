@@ -58,7 +58,7 @@ func New(route config.Route) *Handler {
 		h.cacheTTL = "public, max-age=" + strconv.FormatInt(int64(route.BrowserCacheTTL.Seconds()), 10)
 	}
 	if route.StaticCacheTTL != nil && route.StaticCacheTTL.Duration > 0 {
-		h.cache = newFileCache(route.StaticCacheTTL.Duration)
+		h.cache = newFileCache(route.StaticCacheTTL.Duration, route.EffectiveStaticCacheMaxBytes())
 	}
 	return h
 }
@@ -505,7 +505,9 @@ type cacheEntry struct {
 	data    []byte
 }
 
-// maxCacheEntries bounds the number of distinct files held in memory.
+// maxCacheEntries bounds the number of distinct files held in memory. It is a
+// secondary guard; the total-byte budget (fileCache.maxBytes) is the primary
+// bound on resident memory.
 const maxCacheEntries = 4096
 
 type cacheItem struct {
@@ -518,14 +520,21 @@ type cacheItem struct {
 // syscalls. It deliberately does not revalidate against disk before expiry, so
 // the configured static_cache_ttl bounds how stale a served file can be —
 // mirroring nginx's open_file_cache trade-off.
+//
+// Resident memory is bounded two ways: maxEntries caps the count and maxBytes
+// caps the summed body size. Without the byte budget a cache of maxCacheEntries
+// 1 MiB files could pin gigabytes; bounding bytes keeps the footprint inside
+// the process memory limit regardless of file sizes.
 type fileCache struct {
-	mu      sync.RWMutex
-	entries map[string]cacheItem
-	ttl     time.Duration
+	mu       sync.RWMutex
+	entries  map[string]cacheItem
+	ttl      time.Duration
+	maxBytes int64
+	curBytes int64
 }
 
-func newFileCache(ttl time.Duration) *fileCache {
-	return &fileCache{entries: make(map[string]cacheItem), ttl: ttl}
+func newFileCache(ttl time.Duration, maxBytes int64) *fileCache {
+	return &fileCache{entries: make(map[string]cacheItem), ttl: ttl, maxBytes: maxBytes}
 }
 
 func (c *fileCache) get(key string) (*cacheEntry, bool) {
@@ -538,7 +547,7 @@ func (c *fileCache) get(key string) (*cacheEntry, bool) {
 	if time.Now().After(it.expires) {
 		c.mu.Lock()
 		if cur, ok := c.entries[key]; ok && time.Now().After(cur.expires) {
-			delete(c.entries, key)
+			c.removeLocked(key, cur)
 		}
 		c.mu.Unlock()
 		return nil, false
@@ -547,17 +556,41 @@ func (c *fileCache) get(key string) (*cacheEntry, bool) {
 }
 
 func (c *fileCache) put(key string, e *cacheEntry) {
+	size := int64(len(e.data))
+	// A single file larger than the whole budget is never cacheable.
+	if c.maxBytes > 0 && size > c.maxBytes {
+		return
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if len(c.entries) >= maxCacheEntries {
-		if _, exists := c.entries[key]; !exists {
-			for k := range c.entries {
-				delete(c.entries, k)
-				break
-			}
+
+	if old, exists := c.entries[key]; exists {
+		c.curBytes -= int64(len(old.entry.data))
+		delete(c.entries, key)
+	}
+
+	// Evict until both the count and byte budgets admit the new entry.
+	for len(c.entries) >= maxCacheEntries || (c.maxBytes > 0 && c.curBytes+size > c.maxBytes) {
+		evicted := false
+		for k, it := range c.entries {
+			c.removeLocked(k, it)
+			evicted = true
+			break
+		}
+		if !evicted {
+			break // map empty; nothing left to evict
 		}
 	}
+
 	c.entries[key] = cacheItem{entry: e, expires: time.Now().Add(c.ttl)}
+	c.curBytes += size
+}
+
+// removeLocked deletes an entry and adjusts the byte counter. Caller holds mu.
+func (c *fileCache) removeLocked(key string, it cacheItem) {
+	delete(c.entries, key)
+	c.curBytes -= int64(len(it.entry.data))
 }
 
 func precompressedGzip(r *http.Request, target string) (*gzipFile, bool) {

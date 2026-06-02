@@ -1069,6 +1069,45 @@ func TestStatic_CacheBypassesLargeFiles(t *testing.T) {
 	}
 }
 
+func TestFileCache_ByteBudgetEvicts(t *testing.T) {
+	c := newFileCache(time.Hour, 100) // 100-byte budget
+
+	mk := func(n int) *cacheEntry { return &cacheEntry{data: make([]byte, n)} }
+
+	c.put("a", mk(60))
+	c.put("b", mk(60)) // pushes total to 120 > 100, must evict "a"
+
+	if c.curBytes > c.maxBytes {
+		t.Fatalf("curBytes=%d exceeds budget=%d", c.curBytes, c.maxBytes)
+	}
+	if len(c.entries) != 1 {
+		t.Fatalf("entries=%d, want 1 after eviction", len(c.entries))
+	}
+	if _, ok := c.get("b"); !ok {
+		t.Errorf("most recent entry %q should remain", "b")
+	}
+}
+
+func TestFileCache_OversizedNotCached(t *testing.T) {
+	c := newFileCache(time.Hour, 50)
+	c.put("x", &cacheEntry{data: make([]byte, 100)}) // bigger than whole budget
+	if len(c.entries) != 0 || c.curBytes != 0 {
+		t.Fatalf("oversized entry was cached: entries=%d bytes=%d", len(c.entries), c.curBytes)
+	}
+}
+
+func TestFileCache_OverwriteAdjustsBytes(t *testing.T) {
+	c := newFileCache(time.Hour, 1000)
+	c.put("k", &cacheEntry{data: make([]byte, 100)})
+	c.put("k", &cacheEntry{data: make([]byte, 30)}) // overwrite, smaller
+	if c.curBytes != 30 {
+		t.Fatalf("curBytes=%d, want 30 after overwrite", c.curBytes)
+	}
+	if len(c.entries) != 1 {
+		t.Fatalf("entries=%d, want 1", len(c.entries))
+	}
+}
+
 func TestStatic_PrecompressedDisabled(t *testing.T) {
 	logger.Init()
 

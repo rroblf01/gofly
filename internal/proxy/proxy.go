@@ -20,19 +20,58 @@ type UpstreamSetter interface {
 	SetUpstream(string)
 }
 
-var DefaultTransport = &http.Transport{
-	MaxIdleConns:        1024,
-	MaxIdleConnsPerHost: 256,
-	MaxConnsPerHost:     0,
-	IdleConnTimeout:     90 * time.Second,
-	ForceAttemptHTTP2:   true,
-	WriteBufferSize:     64 << 10,
-	ReadBufferSize:      64 << 10,
-	TLSClientConfig: &tls.Config{
-		InsecureSkipVerify: false,
-	},
-	DisableCompression: false,
+// transportTuning holds the pool/buffer sizes applied to every upstream
+// transport. It is set once at startup via Configure and then read-only, so the
+// hot path needs no synchronisation.
+type transportTuning struct {
+	maxIdleConns        int
+	maxIdleConnsPerHost int
+	bufferSize          int
 }
+
+var tuning = transportTuning{
+	maxIdleConns:        config.DefaultUpstreamMaxIdleConns,
+	maxIdleConnsPerHost: config.DefaultUpstreamMaxIdleConnsPerHost,
+	bufferSize:          config.DefaultUpstreamBufferSize,
+}
+
+// Configure sets the global upstream transport tuning. Call before New (i.e.
+// before any proxy is built); it also resets the cached transports so a SIGHUP
+// reload picks up new values.
+func Configure(u config.Upstream) {
+	tuning = transportTuning{
+		maxIdleConns:        u.MaxIdleConns,
+		maxIdleConnsPerHost: u.MaxIdleConnsPerHost,
+		bufferSize:          u.BufferSize,
+	}
+	DefaultTransport = newTransport(0)
+	timeoutTransports = sync.Map{}
+}
+
+// newTransport builds a transport with the current tuning and an optional
+// response-header timeout (0 = none).
+func newTransport(responseHeaderTimeout time.Duration) *http.Transport {
+	return &http.Transport{
+		MaxIdleConns:          tuning.maxIdleConns,
+		MaxIdleConnsPerHost:   tuning.maxIdleConnsPerHost,
+		MaxConnsPerHost:       0,
+		IdleConnTimeout:       90 * time.Second,
+		ForceAttemptHTTP2:     true,
+		WriteBufferSize:       tuning.bufferSize,
+		ReadBufferSize:        tuning.bufferSize,
+		TLSClientConfig:       &tls.Config{InsecureSkipVerify: false},
+		DisableCompression:    false,
+		ResponseHeaderTimeout: responseHeaderTimeout,
+	}
+}
+
+// DefaultTransport is the shared transport for routes without a per-route
+// upstream timeout. Rebuilt by Configure.
+var DefaultTransport = newTransport(0)
+
+// timeoutTransports caches one transport per distinct ResponseHeaderTimeout, so
+// N routes sharing a timeout share one connection pool instead of allocating N.
+var timeoutTransports sync.Map // time.Duration -> *http.Transport
 
 // wsBufPool recycles the 32 KiB relay buffers used to shuttle bytes between the
 // client and upstream on hijacked WebSocket connections, so long-lived
@@ -105,22 +144,15 @@ func New(route config.Route) (*Proxy, error) {
 }
 
 func transportForRoute(route config.Route) *http.Transport {
-	t := DefaultTransport
-	if route.UpstreamTimeout != nil {
-		t = &http.Transport{
-			MaxIdleConns:          1024,
-			MaxIdleConnsPerHost:   256,
-			MaxConnsPerHost:       0,
-			IdleConnTimeout:       90 * time.Second,
-			ForceAttemptHTTP2:     true,
-			WriteBufferSize:       64 << 10,
-			ReadBufferSize:        64 << 10,
-			TLSClientConfig:       &tls.Config{InsecureSkipVerify: false},
-			DisableCompression:    false,
-			ResponseHeaderTimeout: route.UpstreamTimeout.Duration,
-		}
+	if route.UpstreamTimeout == nil {
+		return DefaultTransport
 	}
-	return t
+	d := route.UpstreamTimeout.Duration
+	if t, ok := timeoutTransports.Load(d); ok {
+		return t.(*http.Transport)
+	}
+	t, _ := timeoutTransports.LoadOrStore(d, newTransport(d))
+	return t.(*http.Transport)
 }
 
 func (p *Proxy) next() *UpstreamState {

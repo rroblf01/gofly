@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -623,6 +624,20 @@ func Run(cfg config.Config, configPath string) error {
 		logger.Info("gc percent set", logger.LogFields{"gogc": cfg.GOGC})
 	}
 
+	if cfg.MaxProcs > 0 {
+		prev := runtime.GOMAXPROCS(cfg.MaxProcs)
+		logger.Info("gomaxprocs set", logger.LogFields{"gomaxprocs": cfg.MaxProcs, "previous": prev})
+	}
+
+	// Apply transport tuning before any proxy route is built in New.
+	up := cfg.EffectiveUpstream()
+	proxy.Configure(up)
+	logger.Info("upstream transport tuned", logger.LogFields{
+		"max_idle_conns":          up.MaxIdleConns,
+		"max_idle_conns_per_host": up.MaxIdleConnsPerHost,
+		"buffer_size":             up.BufferSize,
+	})
+
 	srv := New(cfg)
 	srv.configPath = configPath
 
@@ -655,6 +670,7 @@ func Run(cfg config.Config, configPath string) error {
 					continue
 				}
 				srv.cfg = newCfg
+				proxy.Configure(newCfg.EffectiveUpstream())
 				srv.rebuildHandler()
 				logger.Info("config reloaded", logger.LogFields{})
 			default:
@@ -784,6 +800,28 @@ func putGzipWriter(level int, gw *gzip.Writer) {
 	}
 }
 
+// gzipBufPool recycles the threshold buffer used when minLength > 0, so small
+// responses don't each allocate (and discard) a fresh backing array while
+// waiting to learn whether they cross the gzip threshold.
+var gzipBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 0, 16<<10)
+		return &b
+	},
+}
+
+func getGzipBuf() []byte {
+	return (*gzipBufPool.Get().(*[]byte))[:0]
+}
+
+func putGzipBuf(b []byte) {
+	if cap(b) == 0 {
+		return
+	}
+	b = b[:0]
+	gzipBufPool.Put(&b)
+}
+
 // gzipResponseWriter compresses responses lazily. With minLength == 0 it commits
 // to gzip on the first write (streaming, historical behaviour). With
 // minLength > 0 it buffers until the body crosses the threshold, sending small
@@ -856,14 +894,19 @@ func (g *gzipResponseWriter) Write(b []byte) (int, error) {
 		g.commitGzip()
 		return g.gw.Write(b)
 	}
+	if g.buf == nil {
+		g.buf = getGzipBuf()
+	}
 	g.buf = append(g.buf, b...)
 	if len(g.buf) >= g.minLength {
 		g.commitGzip()
-		buf := g.buf
-		g.buf = nil
-		if _, err := g.gw.Write(buf); err != nil {
+		if _, err := g.gw.Write(g.buf); err != nil {
+			putGzipBuf(g.buf)
+			g.buf = nil
 			return 0, err
 		}
+		putGzipBuf(g.buf)
+		g.buf = nil
 	}
 	return len(b), nil
 }
@@ -875,8 +918,9 @@ func (g *gzipResponseWriter) finish() {
 		g.commitPlain()
 		if len(g.buf) > 0 {
 			g.ResponseWriter.Write(g.buf)
-			g.buf = nil
 		}
+		putGzipBuf(g.buf)
+		g.buf = nil
 		return
 	}
 	if g.gzipOn && g.gw != nil {

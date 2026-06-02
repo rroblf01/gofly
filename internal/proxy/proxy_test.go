@@ -695,6 +695,47 @@ func TestProxy_TransportReuse(t *testing.T) {
 	}
 }
 
+func TestTransportForRoute_NoTimeoutSharesDefault(t *testing.T) {
+	a := transportForRoute(config.Route{Path: "/a"})
+	b := transportForRoute(config.Route{Path: "/b"})
+	if a != DefaultTransport || b != DefaultTransport {
+		t.Fatal("routes without upstream_timeout should share DefaultTransport")
+	}
+}
+
+func TestTransportForRoute_SameTimeoutShared(t *testing.T) {
+	d := config.Duration{Duration: 7 * time.Second}
+	r1 := config.Route{Path: "/a", UpstreamTimeout: &d}
+	r2 := config.Route{Path: "/b", UpstreamTimeout: &d}
+
+	t1 := transportForRoute(r1)
+	t2 := transportForRoute(r2)
+	if t1 != t2 {
+		t.Fatal("routes with the same upstream_timeout should share one transport")
+	}
+	if t1.ResponseHeaderTimeout != d.Duration {
+		t.Errorf("ResponseHeaderTimeout = %v, want %v", t1.ResponseHeaderTimeout, d.Duration)
+	}
+
+	other := config.Duration{Duration: 3 * time.Second}
+	t3 := transportForRoute(config.Route{Path: "/c", UpstreamTimeout: &other})
+	if t3 == t1 {
+		t.Fatal("distinct timeouts must not share a transport")
+	}
+}
+
+func TestConfigure_AppliesTuning(t *testing.T) {
+	t.Cleanup(func() { c := config.Config{}; Configure(c.EffectiveUpstream()) })
+
+	Configure(config.Upstream{MaxIdleConns: 8, MaxIdleConnsPerHost: 4, BufferSize: 4096})
+	if DefaultTransport.MaxIdleConns != 8 ||
+		DefaultTransport.MaxIdleConnsPerHost != 4 ||
+		DefaultTransport.WriteBufferSize != 4096 ||
+		DefaultTransport.ReadBufferSize != 4096 {
+		t.Fatalf("Configure did not apply tuning: %+v", DefaultTransport)
+	}
+}
+
 func TestProxy_ForwardsXForwardedHeaders(t *testing.T) {
 	var forwardedFor, forwardedHost, forwardedProto string
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

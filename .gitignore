@@ -3,3 +3,5 @@ coverage.out
 coverage.html
 *.orig
 .DS_Store
+
+.claude/
