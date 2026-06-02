@@ -275,6 +275,42 @@ gofly -t -config config.json                         # then validate the result
 set. Review every warning — the converted route set may need hand-editing where
 nginx used a feature gofly does not have.
 
+#### Converting at build time in a Dockerfile
+
+The runtime gofly image is `scratch` — no shell — so it cannot run
+`gofly -convert nginx.conf > config.json` itself (the `>` redirection needs a
+shell). Do the conversion in a small intermediate stage that *has* a shell,
+using the gofly binary copied straight out of the published image, then copy the
+generated `config.json` into the final `scratch` stage:
+
+```dockerfile
+# Stage: convert nginx.conf -> config.json (needs a shell for the redirection)
+FROM alpine:3 AS nginx-convert
+COPY --from=ghcr.io/rroblf01/gofly:latest /gofly /gofly
+COPY nginx.conf /nginx.conf
+# Convert; warnings print to the build log. `-t` fails the build if the result
+# is invalid, so a bad conversion never ships.
+RUN /gofly -convert /nginx.conf > /config.json && /gofly -t -config /config.json
+
+# Final image
+FROM ghcr.io/rroblf01/gofly:latest
+COPY --from=nginx-convert /config.json /etc/gofly/config.json
+COPY --from=builder /app/dist/ /www/
+EXPOSE 80
+CMD ["-config", "/etc/gofly/config.json"]
+```
+
+- `COPY --from=ghcr.io/rroblf01/gofly:latest /gofly /gofly` pulls the static
+  binary out of the published image — no separate build needed. It runs on
+  `alpine` because it is fully static (`CGO_ENABLED=0`).
+- Conversion happens **once, at build time**; the resulting `config.json` is
+  baked into the image. Watch the build log for `WARN` lines and review them.
+- `&& /gofly -t -config /config.json` makes a config that fails validation fail
+  the build, so a broken conversion never reaches production.
+- Need to keep editing the config? Commit the converted `config.json` instead and
+  `COPY` it directly — converting on every build re-applies the same warnings and
+  silently re-drops anything you patched by hand.
+
 ## API
 
 ### Health check
