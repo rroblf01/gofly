@@ -391,20 +391,23 @@ docker compose --profile example up -d
 Same static page (`www/index.html`, 798 B), same machine for every row
 (AMD Ryzen 5 3600, 6 cores / 12 threads, Linux 6.18). nginx runs in Docker with
 `--network host`, `worker_processes auto`, `access_log off`, `sendfile on`.
+**Both servers are tested over HTTP/1.1 with keep-alive** — `wrk` only speaks
+HTTP/1.1, and nginx listens plaintext with no `http2` directive, so this is a
+like-for-like protocol comparison (see the HTTP/2 note below).
 
 | Config | Requests/s | Latency (avg) | Memory (RSS) |
 |---|---|---|---|
-| gofly (1 worker, no cache, default GC) | 90,300 | 1.26 ms | **~22 MB** |
-| gofly (×12, no cache, default GC) | 90,300 | 1.26 ms | ~22 MB |
-| gofly (×12, **static_cache_ttl**, default GC) | 85,700 | 1.35 ms | ~22 MB |
-| gofly (×12, **static_cache_ttl**, GOGC=off, GOMEMLIMIT=200MiB) | 89,400 | 1.18 ms | ~96 MB |
-| gofly (×12, **static_cache_ttl**, GOGC=off, **metrics off**) | 88,800 | 1.18 ms | ~96 MB |
-| **nginx alpine** (`worker_processes auto`) | **209,300** | **0.55 ms** | ~59 MB (13 procs) |
+| gofly (1 worker, no cache, default GC) | 98,600 | 1.28 ms | **~21 MB** |
+| gofly (×12, no cache, default GC) | 98,600 | 1.28 ms | ~21 MB |
+| gofly (×12, **static_cache_ttl**, default GC) | 87,600 | 1.34 ms | ~21 MB |
+| gofly (×12, **static_cache_ttl**, GOGC=off, GOMEMLIMIT=200MiB) | 95,100 | 1.36 ms | ~95 MB |
+| gofly (×12, **static_cache_ttl**, GOGC=off, **metrics off**) | 96,800 | 1.26 ms | ~95 MB |
+| **nginx alpine** (`worker_processes auto`) | **216,300** | **0.59 ms** | ~58 MB (13 procs) |
 
 Medians of 3 runs. On a single hot file the cache slightly *lowers* throughput
 (see below), so the fastest — and leanest — config is plain no-cache.
 
-On a single hot file gofly tops out around **~90k req/s**, roughly **43% of
+On a single hot file gofly tops out around **~99k req/s**, roughly **46% of
 nginx's throughput** at about **2× the latency**.
 
 #### What actually limits it (it is not the kernel, and it is not Go)
@@ -415,16 +418,17 @@ machine show why:
 
 | Reference server | Requests/s | What it does per request |
 |---|---|---|
-| stock `net/http`, write 5 bytes (no I/O) | **243,000** | one `write()` |
-| stock `http.FileServer` (same 798 B file) | 91,600 | `open`+`fstat`+`sendfile` |
-| gofly (no cache) | 90,300 | `open`+`fstat`+`sendfile` |
-| nginx alpine | 209,300 | cached fd + `sendfile` |
+| stock `net/http`, write 5 bytes (no I/O) | **233,000** | one `write()` |
+| stock `http.FileServer` (same 798 B file) | 94,300 | `open`+`fstat`+`sendfile` |
+| gofly (no cache) | 98,600 | `open`+`fstat`+`sendfile` |
+| nginx alpine | 216,300 | cached fd + `sendfile` |
 
-- The loopback path is **not** the wall: a bare Go handler does **243k** on it.
-- Go's `net/http` is **not** the wall either — that 243k *is* `net/http`.
+- The loopback path is **not** the wall: a bare Go handler does **233k** on it.
+- Go's `net/http` is **not** the wall either — that 233k *is* `net/http`.
 - The wall is the **per-request `open()` + `fstat()` on the static path**: it
-  drops Go from 243k to ~91k. gofly tracks stock `http.FileServer` almost
-  exactly, so this is the cost of file serving in `net/http`, not gofly's code.
+  drops Go from 233k to ~95–99k. gofly tracks stock `http.FileServer` (and edges
+  past it on the optimised header path), so this is the cost of file serving in
+  `net/http`, not gofly's code.
 - nginx is ~2× faster on a hot file because its `open_file_cache` keeps the fd +
   stat resident, so it pays neither syscall per request — it serves much closer
   to its own write ceiling.
@@ -439,14 +443,15 @@ per-request `open`/`fstat`/`read`, which is exactly the limiter above. Across
 
 | Config | Single hot file | 1000 files (random) |
 |---|---|---|
-| gofly (no cache) | 90,300 | 106,800 |
-| gofly (**static_cache_ttl**) | 85,700 | **183,100** |
-| nginx alpine | 209,300 | 240,900 |
+| gofly (no cache) | 98,600 | 109,800 |
+| gofly (**static_cache_ttl**) | 87,600 | **189,100** |
+| nginx alpine | 216,300 | 262,300 |
 
-With the cache, gofly reaches **~76% of nginx** on the many-files workload
-(vs ~43% on a single file). The cache hot path is allocation-lean — 18 allocs and
-~2.2 µs per hit, with `Last-Modified`/`Content-Length` precomputed at insertion
-so nothing is reformatted per request (see `serveCached` in
+With the cache, gofly reaches **~72% of nginx** on the many-files workload
+(vs ~46% on a single file). The cache hot path is allocation-lean — 14 allocs and
+~1.9 µs per hit, with `Last-Modified`/`Content-Length` precomputed at insertion
+and the static security-header slices shared package-level so nothing is
+reformatted or reallocated per request (see `serveCached` in
 `internal/static/static.go`, guarded by `BenchmarkCacheHit`).
 
 **Rule of thumb:** enable `static_cache_ttl` for many small files or a cold page
@@ -477,11 +482,11 @@ worker pool, more workers, a bigger accept fan-out. Measured in-process
 
 | In-process cache hit | ns/op | ≈ throughput |
 |---|---|---|
-| 1 file (one hot key) | ~1,145 | ~870k req/s/core |
-| 1000 files (spread) | ~845 | ~1.18M req/s/core |
+| 1 file (one hot key) | ~1,150 | ~870k req/s/core |
+| 1000 files (spread) | ~775 | ~1.29M req/s/core |
 
 The handler sustains **over a million requests per second per core** in
-user-space, yet the socket-level load test tops out at 85k–183k req/s *total*.
+user-space, yet the socket-level load test tops out at 88k–189k req/s *total*.
 gofly's own code runs **50–100× faster than the requests it receives over a
 socket** — it is nowhere near the bottleneck. Conclusions:
 
@@ -490,7 +495,7 @@ socket** — it is nowhere near the bottleneck. Conclusions:
   already goroutine-per-connection. Adding a second pool on top only adds a queue
   and a hand-off.
 - **More workers/goroutines do nothing.** 1 vs 12 `workers` (SO_REUSEPORT) measured
-  identically (~90k). With 100 client connections there are already 100 handler
+  identically (~99k). With 100 client connections there are already 100 handler
   goroutines; adding more than there are connections changes nothing.
 - **Micro-optimising the handler does nothing for throughput either** — there is
   50–100× of headroom. (It still helps *allocations*; see below.)
@@ -510,11 +515,34 @@ allocations let a *tighter* GC (`GOGC`) hit the same throughput at lower RSS, or
 the same RSS with less GC CPU — which is the trade-off that actually concerns a
 memory-budgeted deployment. That is why the cache hot path
 (`serveCached`) precomputes `Last-Modified`/`Content-Length` at insertion and
-writes the body directly instead of going through a reader (18 vs 21 allocs/hit,
+writes the body directly instead of going through a reader, and shares the
+constant security-header slices package-level (down from 21 to 14 allocs/hit,
 guarded by `BenchmarkCacheHit`). Beyond that the handler already allocates little;
 most remaining per-request allocations live inside `net/http` and are not
 reachable without leaving the stdlib server. Diminishing returns — so gofly stops
 here rather than trading its footprint and simplicity for a few percent.
+
+#### Is the gap because gofly uses HTTP/1.1 and nginx uses HTTP/2?
+
+No — both servers serve **HTTP/1.1** in these tests, so the gap is not a protocol
+difference:
+
+- `wrk` is an HTTP/1.1-only client; it never negotiates HTTP/2. Whatever the
+  server supports, the load is driven over HTTP/1.1.
+- The nginx config listens plaintext (`listen 8390;`) with **no `http2`
+  directive and no TLS**, so nginx also answers HTTP/1.1 here.
+- gofly negotiates HTTP/2 automatically over TLS (ALPN `h2`); plaintext is
+  HTTP/1.1 (see [HTTP/2](#http2)). These benchmarks are plaintext, so gofly is on
+  HTTP/1.1 too.
+
+HTTP/2 would not flip this result anyway. Its wins — header compression, request
+multiplexing over a single connection — target many concurrent streams over
+higher-latency links, not raw throughput of small independent requests on
+loopback. For this workload HTTP/2's single-connection multiplexing (with its
+framing overhead and per-connection flow control) is typically **slower** than
+HTTP/1.1 across many keep-alive connections, which is exactly what `wrk -c100`
+drives. The bottleneck is the per-request syscall path described above, and it is
+the same under either protocol.
 
 ### Comparison with nginx
 
@@ -523,10 +551,10 @@ leanest) vs nginx alpine, same machine:
 
 | Metric | gofly (scratch) | nginx (alpine) | Difference |
 |---|---|---|---|
-| **Requests/sec** (single hot file) | 90,300 | 209,300 | **-57%** |
-| **Requests/sec** (1000 files, cache on) | 183,100 | 240,900 | **-24%** |
-| **Latency (avg)** | 1.26 ms | **0.55 ms** | **+129%** |
-| **RSS under load (default GC)** | **~22 MB** | ~59 MB (13 procs) | **~2.7× smaller** 🏆 |
+| **Requests/sec** (single hot file) | 98,600 | 216,300 | **-54%** |
+| **Requests/sec** (1000 files, cache on) | 189,100 | 262,300 | **-28%** |
+| **Latency (avg)** | 1.28 ms | **0.59 ms** | **+117%** |
+| **RSS under load (default GC)** | **~21 MB** | ~58 MB (13 procs) | **~2.8× smaller** 🏆 |
 | **Image size** | **~7 MB** | ~35 MB | **5× smaller** 🏆 |
 | **Dependencies** | **0** (pure stdlib) | libc, PCRE, zlib, OpenSSL | **—** 🏆 |
 | **Static binary** | ✅ Yes | ❌ No | **—** 🏆 |
@@ -534,9 +562,9 @@ leanest) vs nginx alpine, same machine:
 | **Configuration** | **JSON (simple)** | nginx.conf | **—** 🏆 |
 
 > nginx remains the throughput/latency leader on raw static serving — about
-> 2.6× the requests/sec here. gofly trades that for a **~7 MB static binary,
-> zero dependencies, memory safety, and a ~20 MB resident footprint** (a third
-> of nginx's) under the default GC. Pick gofly when footprint, deployment
+> 2.2× the requests/sec here. gofly trades that for a **~7 MB static binary,
+> zero dependencies, memory safety, and a ~21 MB resident footprint** (about a
+> third of nginx's) under the default GC. Pick gofly when footprint, deployment
 > simplicity, and safety matter more than topping out a single static endpoint;
 > pick nginx when maximum static throughput is the goal.
 
@@ -549,8 +577,8 @@ leanest) vs nginx alpine, same machine:
 | State | gofly (default GC) | gofly (GOGC=off, GOMEMLIMIT=200MiB) |
 |---|---|---|
 | Idle (no traffic) | ~10 MB | ~10 MB |
-| Sustained load, no cache | ~21 MB | ~92 MB |
-| Sustained load, static cache | ~21 MB | ~93 MB |
+| Sustained load, no cache | ~21 MB | ~95 MB |
+| Sustained load, static cache | ~21 MB | ~95 MB |
 
 > The static cache is bounded two ways: a total-byte budget
 > (`static_cache_max_bytes`, default 64 MiB) and a count cap (4096 entries),

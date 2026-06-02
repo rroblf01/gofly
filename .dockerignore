@@ -4,3 +4,4 @@ build/
 *.md
 coverage.*
 *.test
+gofly

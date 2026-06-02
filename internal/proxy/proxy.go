@@ -5,7 +5,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"net/http/httputil"
 	"net/url"
 	"strings"
 	"sync"
@@ -27,12 +26,14 @@ type transportTuning struct {
 	maxIdleConns        int
 	maxIdleConnsPerHost int
 	bufferSize          int
+	disableHTTP2        bool
 }
 
 var tuning = transportTuning{
 	maxIdleConns:        config.DefaultUpstreamMaxIdleConns,
 	maxIdleConnsPerHost: config.DefaultUpstreamMaxIdleConnsPerHost,
 	bufferSize:          config.DefaultUpstreamBufferSize,
+	disableHTTP2:        false,
 }
 
 // Configure sets the global upstream transport tuning. Call before New (i.e.
@@ -43,6 +44,7 @@ func Configure(u config.Upstream) {
 		maxIdleConns:        u.MaxIdleConns,
 		maxIdleConnsPerHost: u.MaxIdleConnsPerHost,
 		bufferSize:          u.BufferSize,
+		disableHTTP2:        u.DisableHTTP2,
 	}
 	DefaultTransport = newTransport(0)
 	timeoutTransports = sync.Map{}
@@ -51,18 +53,21 @@ func Configure(u config.Upstream) {
 // newTransport builds a transport with the current tuning and an optional
 // response-header timeout (0 = none).
 func newTransport(responseHeaderTimeout time.Duration) *http.Transport {
-	return &http.Transport{
+	tr := &http.Transport{
 		MaxIdleConns:          tuning.maxIdleConns,
 		MaxIdleConnsPerHost:   tuning.maxIdleConnsPerHost,
 		MaxConnsPerHost:       0,
 		IdleConnTimeout:       90 * time.Second,
-		ForceAttemptHTTP2:     true,
 		WriteBufferSize:       tuning.bufferSize,
 		ReadBufferSize:        tuning.bufferSize,
 		TLSClientConfig:       &tls.Config{InsecureSkipVerify: false},
-		DisableCompression:    false,
+		DisableCompression:    true,
 		ResponseHeaderTimeout: responseHeaderTimeout,
 	}
+	if !tuning.disableHTTP2 {
+		tr.ForceAttemptHTTP2 = true
+	}
+	return tr
 }
 
 // DefaultTransport is the shared transport for routes without a per-route
@@ -73,6 +78,15 @@ var DefaultTransport = newTransport(0)
 // N routes sharing a timeout share one connection pool instead of allocating N.
 var timeoutTransports sync.Map // time.Duration -> *http.Transport
 
+// proxyBufPool recycles the 32 KiB relay buffers used for copying response
+// bodies in the proxy hot path, avoiding an allocation per request.
+var proxyBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 32*1024)
+		return &b
+	},
+}
+
 // wsBufPool recycles the 32 KiB relay buffers used to shuttle bytes between the
 // client and upstream on hijacked WebSocket connections, so long-lived
 // connections don't each pin two fresh buffers.
@@ -81,6 +95,52 @@ var wsBufPool = sync.Pool{
 		b := make([]byte, 32*1024)
 		return &b
 	},
+}
+
+var hopByHopHeaders = []string{
+	"Connection",
+	"Keep-Alive",
+	"Proxy-Connection",
+	"Proxy-Authenticate",
+	"Proxy-Authorization",
+	"Te",
+	"Trailer",
+	"Transfer-Encoding",
+	"Upgrade",
+}
+
+func isHopByHop(k string) bool {
+	for _, h := range hopByHopHeaders {
+		if strings.EqualFold(k, h) {
+			return true
+		}
+	}
+	return false
+}
+
+func removeConnectionHeaders(h http.Header) {
+	for _, v := range h["Connection"] {
+		for _, f := range strings.Split(v, ",") {
+			if f = strings.TrimSpace(f); f != "" {
+				h.Del(f)
+			}
+		}
+	}
+}
+
+// singleJoiningSlash joins two URL path segments ensuring exactly one slash
+// between them. Replicates httputil.NewSingleHostReverseProxy's internal
+// behaviour.
+func singleJoiningSlash(a, b string) string {
+	aslash := strings.HasSuffix(a, "/")
+	bslash := strings.HasPrefix(b, "/")
+	switch {
+	case aslash && bslash:
+		return a + b[1:]
+	case !aslash && !bslash:
+		return a + "/" + b
+	}
+	return a + b
 }
 
 type UpstreamState struct {
@@ -100,11 +160,10 @@ type UpstreamStatus struct {
 }
 
 type Proxy struct {
-	route          config.Route
-	upstreams      []*UpstreamState
-	counter        atomic.Uint64
-	reverseproxies []*httputil.ReverseProxy
-	strategy       string
+	route     config.Route
+	upstreams []*UpstreamState
+	counter   atomic.Uint64
+	strategy  string
 
 	hcClient *http.Client
 	stopHC   chan struct{}
@@ -127,17 +186,8 @@ func New(route config.Route) (*Proxy, error) {
 		if err != nil {
 			return nil, err
 		}
-
 		state := &UpstreamState{url: parsed, index: i}
 		p.upstreams = append(p.upstreams, state)
-
-		rp := httputil.NewSingleHostReverseProxy(parsed)
-		rp.Transport = transportForRoute(route)
-		rp.ErrorHandler = p.errorHandler(state)
-
-		baseDirector := rp.Director
-		rp.Director = p.director(parsed, baseDirector)
-		p.reverseproxies = append(p.reverseproxies, rp)
 	}
 
 	return p, nil
@@ -162,9 +212,6 @@ func (p *Proxy) next() *UpstreamState {
 	}
 
 	if p.strategy == "least_conn" {
-		// Pick the healthy upstream with the fewest in-flight requests. The
-		// rotating start makes ties round-robin instead of always favoring the
-		// lowest index.
 		start := p.counter.Add(1)
 		var best *UpstreamState
 		var bestLoad int32
@@ -217,13 +264,87 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
 	}
 
-	p.reverseproxies[up.index].ServeHTTP(w, r)
+	p.serveHTTP(w, r, up)
+}
+
+func (p *Proxy) serveHTTP(w http.ResponseWriter, r *http.Request, up *UpstreamState) {
+	for {
+		out := r.Clone(r.Context())
+		out.RequestURI = ""
+		if out.Header == nil {
+			out.Header = make(http.Header)
+		}
+
+		target := up.url
+		out.URL.Scheme = target.Scheme
+		out.URL.Host = target.Host
+		out.URL.Path = singleJoiningSlash(target.Path, r.URL.Path)
+		out.URL.RawPath = ""
+
+		if target.RawQuery == "" || r.URL.RawQuery == "" {
+			out.URL.RawQuery = target.RawQuery + r.URL.RawQuery
+		} else {
+			out.URL.RawQuery = target.RawQuery + "&" + r.URL.RawQuery
+		}
+
+		if pw, ok := target.User.Password(); ok {
+			out.SetBasicAuth(target.User.Username(), pw)
+		}
+
+		p.applyDirector(out)
+
+		removeConnectionHeaders(out.Header)
+		for _, h := range hopByHopHeaders {
+			out.Header.Del(h)
+		}
+
+		transport := transportForRoute(p.route)
+		resp, err := transport.RoundTrip(out)
+		if err != nil {
+			p.recordFailure(up)
+			if p.route.RetryOnError {
+				if up2 := p.next(); up2 != nil && up2 != up {
+					logger.Info("retrying with next upstream", logger.LogFields{
+						"upstream": up2.url.String(),
+						"path":     r.URL.Path,
+					})
+					up = up2
+					continue
+				}
+			}
+			logger.Error("proxy error", logger.LogFields{
+				"upstream": up.url.String(),
+				"path":     r.URL.Path,
+				"error":    err.Error(),
+			})
+			http.Error(w, "bad gateway", http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+
+		for k, v := range resp.Header {
+			if !isHopByHop(k) {
+				w.Header()[k] = v
+			}
+		}
+		removeConnectionHeaders(w.Header())
+
+		w.WriteHeader(resp.StatusCode)
+		buf := proxyBufPool.Get().(*[]byte)
+		io.CopyBuffer(w, resp.Body, *buf)
+		proxyBufPool.Put(buf)
+		return
+	}
 }
 
 func (p *Proxy) applyDirector(req *http.Request) {
-	// X-Forwarded-For is left to httputil.ReverseProxy, which appends the
-	// parsed client IP (without port) to any existing chain. For the hijacked
-	// WebSocket path we set it explicitly in serveWebSocket.
+	if ip := removePort(req.RemoteAddr); ip != "" {
+		if prior := req.Header.Get("X-Forwarded-For"); prior != "" {
+			req.Header.Set("X-Forwarded-For", prior+", "+ip)
+		} else {
+			req.Header.Set("X-Forwarded-For", ip)
+		}
+	}
 	req.Header.Set("X-Forwarded-Host", req.Host)
 	req.Header.Set("X-Forwarded-Proto", scheme(req))
 
@@ -238,41 +359,6 @@ func (p *Proxy) applyDirector(req *http.Request) {
 	}
 	if p.route.Rewrite != "" {
 		req.URL.Path = expandVars(p.route.Rewrite, req)
-	}
-}
-
-func (p *Proxy) director(up *url.URL, base func(*http.Request)) func(*http.Request) {
-	return func(req *http.Request) {
-		if base != nil {
-			base(req)
-		}
-		p.applyDirector(req)
-	}
-}
-
-func (p *Proxy) errorHandler(state *UpstreamState) func(http.ResponseWriter, *http.Request, error) {
-	return func(w http.ResponseWriter, r *http.Request, err error) {
-		p.recordFailure(state)
-
-		logger.Error("proxy error", logger.LogFields{
-			"upstream": state.url.String(),
-			"path":     r.URL.Path,
-			"error":    err.Error(),
-		})
-
-		if p.route.RetryOnError {
-			up := p.next()
-			if up != nil && up != state {
-				logger.Info("retrying with next upstream", logger.LogFields{
-					"upstream": up.url.String(),
-					"path":     r.URL.Path,
-				})
-				p.reverseproxies[up.index].ServeHTTP(w, r)
-				return
-			}
-		}
-
-		http.Error(w, "bad gateway", http.StatusBadGateway)
 	}
 }
 
@@ -340,7 +426,6 @@ func (p *Proxy) Stats() []UpstreamStatus {
 }
 
 // Start launches the active health-check loop if health_check_path is set.
-// It is a no-op otherwise. Stop must be called to release the goroutine.
 func (p *Proxy) Start() {
 	if p.hcClient == nil {
 		return
@@ -355,7 +440,7 @@ func (p *Proxy) Start() {
 		defer p.hcWG.Done()
 		t := time.NewTicker(interval)
 		defer t.Stop()
-		p.runHealthChecks() // probe immediately at startup
+		p.runHealthChecks()
 		for {
 			select {
 			case <-t.C:
@@ -477,12 +562,29 @@ func (p *Proxy) serveWebSocket(w http.ResponseWriter, r *http.Request, target *u
 }
 
 func expandVars(val string, r *http.Request) string {
-	val = strings.ReplaceAll(val, "$remote_addr", r.RemoteAddr)
-	val = strings.ReplaceAll(val, "$host", r.Host)
-	val = strings.ReplaceAll(val, "$scheme", scheme(r))
-	val = strings.ReplaceAll(val, "$request_uri", r.URL.RequestURI())
-	val = strings.ReplaceAll(val, "$uri", r.URL.Path)
+	if strings.Contains(val, "$remote_addr") {
+		val = strings.ReplaceAll(val, "$remote_addr", r.RemoteAddr)
+	}
+	if strings.Contains(val, "$host") {
+		val = strings.ReplaceAll(val, "$host", r.Host)
+	}
+	if strings.Contains(val, "$scheme") {
+		val = strings.ReplaceAll(val, "$scheme", scheme(r))
+	}
+	if strings.Contains(val, "$request_uri") {
+		val = strings.ReplaceAll(val, "$request_uri", r.URL.RequestURI())
+	}
+	if strings.Contains(val, "$uri") {
+		val = strings.ReplaceAll(val, "$uri", r.URL.Path)
+	}
 	return val
+}
+
+func removePort(addr string) string {
+	if h, _, err := net.SplitHostPort(addr); err == nil {
+		return h
+	}
+	return addr
 }
 
 func scheme(r *http.Request) string {

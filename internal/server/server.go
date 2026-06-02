@@ -67,7 +67,6 @@ type tokenBucket struct {
 	maxTokens  float64
 	refillRate float64
 	lastRefill time.Time
-	mu         sync.Mutex
 }
 
 func newTokenBucket(rate float64, burst int) *tokenBucket {
@@ -79,10 +78,8 @@ func newTokenBucket(rate float64, burst int) *tokenBucket {
 	}
 }
 
+// allow is called while the caller holds the shard lock, so no mutex needed.
 func (tb *tokenBucket) allow() bool {
-	tb.mu.Lock()
-	defer tb.mu.Unlock()
-
 	now := time.Now()
 	elapsed := now.Sub(tb.lastRefill).Seconds()
 	tb.tokens = min(tb.maxTokens, tb.tokens+elapsed*tb.refillRate)
@@ -137,12 +134,13 @@ func (rl *rateLimiter) shardFor(ip string) *rlShard {
 func (rl *rateLimiter) allow(ip string) bool {
 	s := rl.shardFor(ip)
 	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	b, ok := s.buckets[ip]
 	if !ok {
 		b = newTokenBucket(rl.rate, rl.burst)
 		s.buckets[ip] = b
 	}
-	s.mu.Unlock()
 	return b.allow()
 }
 
@@ -153,10 +151,7 @@ func (rl *rateLimiter) sweep() {
 		s := &rl.shards[i]
 		s.mu.Lock()
 		for ip, b := range s.buckets {
-			b.mu.Lock()
-			idle := b.lastRefill.Before(cutoff)
-			b.mu.Unlock()
-			if idle {
+			if b.lastRefill.Before(cutoff) {
 				delete(s.buckets, ip)
 			}
 		}
@@ -510,16 +505,17 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 		start := time.Now()
 
 		lrw := newResponseWriter(w)
-		defer putResponseWriter(lrw)
 
 		if metricsOn {
 			metrics.IncInFlight()
-			defer metrics.DecInFlight()
 		}
 
 		// Finalize on the way out — runs on both normal return and panic, so a
 		// recovered handler is still counted (as 5xx) and logged.
 		defer func() {
+			if metricsOn {
+				metrics.DecInFlight()
+			}
 			if rec := recover(); rec != nil {
 				if !lrw.written {
 					lrw.WriteHeader(http.StatusInternalServerError)
@@ -540,6 +536,7 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 				default:
 				}
 			}
+			putResponseWriter(lrw)
 		}()
 
 		if id := r.Header.Get("X-Request-ID"); id != "" {

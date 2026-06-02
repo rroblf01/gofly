@@ -17,12 +17,19 @@ import (
 	"github.com/rroblf01/gofly/internal/config"
 )
 
-var sniffPool = sync.Pool{
-	New: func() any {
-		b := make([]byte, 512)
-		return &b
-	},
-}
+var (
+	sniffPool = sync.Pool{
+		New: func() any {
+			b := make([]byte, 512)
+			return &b
+		},
+	}
+
+	nosniffHeader      = []string{"nosniff"}
+	denyFrameHeader    = []string{"DENY"}
+	referrerHeader     = []string{"strict-origin-when-cross-origin"}
+	acceptRangesHeader = []string{"bytes"}
+)
 
 type Handler struct {
 	root          string
@@ -275,15 +282,15 @@ func (h *Handler) serveContent(w http.ResponseWriter, r *http.Request, src io.Re
 	hdr["Content-Length"] = []string{strconv.FormatInt(size, 10)}
 	hdr["Etag"] = []string{etag}
 	hdr["Last-Modified"] = []string{lastMod}
-	hdr["Accept-Ranges"] = []string{"bytes"}
+	hdr["Accept-Ranges"] = acceptRangesHeader
 
 	if h.cacheTTL != "" {
 		hdr["Cache-Control"] = []string{h.cacheTTL}
 	}
 	if h.secHeaders {
-		hdr["X-Content-Type-Options"] = []string{"nosniff"}
-		hdr["X-Frame-Options"] = []string{"DENY"}
-		hdr["Referrer-Policy"] = []string{"strict-origin-when-cross-origin"}
+		hdr["X-Content-Type-Options"] = nosniffHeader
+		hdr["X-Frame-Options"] = denyFrameHeader
+		hdr["Referrer-Policy"] = referrerHeader
 	}
 	for k, v := range h.setHeaders {
 		hdr[http.CanonicalHeaderKey(k)] = []string{v}
@@ -324,14 +331,14 @@ func (h *Handler) serveCached(w http.ResponseWriter, r *http.Request, e *cacheEn
 	hdr["Content-Length"] = []string{e.sizeStr}
 	hdr["Etag"] = []string{e.etag}
 	hdr["Last-Modified"] = []string{e.lastMod}
-	hdr["Accept-Ranges"] = []string{"bytes"}
+	hdr["Accept-Ranges"] = acceptRangesHeader
 	if h.cacheTTL != "" {
 		hdr["Cache-Control"] = []string{h.cacheTTL}
 	}
 	if h.secHeaders {
-		hdr["X-Content-Type-Options"] = []string{"nosniff"}
-		hdr["X-Frame-Options"] = []string{"DENY"}
-		hdr["Referrer-Policy"] = []string{"strict-origin-when-cross-origin"}
+		hdr["X-Content-Type-Options"] = nosniffHeader
+		hdr["X-Frame-Options"] = denyFrameHeader
+		hdr["Referrer-Policy"] = referrerHeader
 	}
 	for k, v := range h.setHeaders {
 		hdr[http.CanonicalHeaderKey(k)] = []string{v}
@@ -392,9 +399,9 @@ func (h *Handler) serveRange(w http.ResponseWriter, r *http.Request, src io.Read
 	hdr["Content-Length"] = []string{strconv.FormatInt(ra.length(), 10)}
 	hdr["Etag"] = []string{etag}
 	hdr["Last-Modified"] = []string{lastMod}
-	hdr["Accept-Ranges"] = []string{"bytes"}
+	hdr["Accept-Ranges"] = acceptRangesHeader
 	if h.secHeaders {
-		hdr["X-Content-Type-Options"] = []string{"nosniff"}
+		hdr["X-Content-Type-Options"] = nosniffHeader
 	}
 	for k, v := range h.setHeaders {
 		hdr[http.CanonicalHeaderKey(k)] = []string{v}
@@ -534,7 +541,7 @@ func (h *Handler) serveError(w http.ResponseWriter, r *http.Request, code int) {
 					hdr := w.Header()
 					hdr["Content-Type"] = []string{mime.TypeByExtension(filepath.Ext(path))}
 					if h.secHeaders {
-						hdr["X-Content-Type-Options"] = []string{"nosniff"}
+						hdr["X-Content-Type-Options"] = nosniffHeader
 					}
 					w.WriteHeader(code)
 					w.Write(data)

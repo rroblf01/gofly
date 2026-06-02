@@ -676,7 +676,7 @@ func TestProxy_TransportReuse(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rp1 := p.reverseproxies[0]
+	tr := transportForRoute(route)
 
 	for i := 0; i < 5; i++ {
 		frontend := httptest.NewServer(p)
@@ -689,7 +689,7 @@ func TestProxy_TransportReuse(t *testing.T) {
 		resp.Body.Close()
 		frontend.Close()
 
-		if p.reverseproxies[0].Transport != rp1.Transport {
+		if transportForRoute(route) != tr {
 			t.Errorf("iteration %d: transport changed", i)
 		}
 	}

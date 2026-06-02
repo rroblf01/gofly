@@ -46,12 +46,10 @@ type Config struct {
 // connection reuse. All fields are optional and fall back to memory-conservative
 // defaults (see DefaultUpstream*).
 type Upstream struct {
-	MaxIdleConns        int `json:"max_idle_conns,omitempty"`
-	MaxIdleConnsPerHost int `json:"max_idle_conns_per_host,omitempty"`
-	// BufferSize is the read/write buffer size in bytes per connection. Each
-	// idle connection pins roughly 2×BufferSize, so this is the dominant knob
-	// for transport memory under many idle upstreams.
-	BufferSize int `json:"buffer_size,omitempty"`
+	MaxIdleConns        int  `json:"max_idle_conns,omitempty"`
+	MaxIdleConnsPerHost int  `json:"max_idle_conns_per_host,omitempty"`
+	BufferSize          int  `json:"buffer_size,omitempty"`
+	DisableHTTP2        bool `json:"disable_http2,omitempty"`
 }
 
 type RateLimit struct {
