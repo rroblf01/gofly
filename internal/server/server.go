@@ -932,7 +932,7 @@ func (g *gzipResponseWriter) finish() {
 // gzipMiddleware keeps the historical single-argument signature (default level,
 // no minimum length) for callers and tests that don't need tuning.
 func gzipMiddleware(next http.Handler) http.Handler {
-	return 	gzipMiddlewareWith(next, -1, 0)
+	return gzipMiddlewareWith(next, -1, 0)
 }
 
 var gzipRWPool = sync.Pool{

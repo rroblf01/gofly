@@ -91,15 +91,15 @@ var wsBufPool = sync.Pool{
 // hopByHopSet contains headers that must not be forwarded per RFC 7230.
 // All keys are canonicalised so we use exact map lookup instead of EqualFold.
 var hopByHopSet = map[string]struct{}{
-	"Connection":        {},
-	"Keep-Alive":        {},
-	"Proxy-Connection":  {},
-	"Proxy-Authenticate": {},
+	"Connection":          {},
+	"Keep-Alive":          {},
+	"Proxy-Connection":    {},
+	"Proxy-Authenticate":  {},
 	"Proxy-Authorization": {},
-	"Te":                {},
-	"Trailer":           {},
-	"Transfer-Encoding": {},
-	"Upgrade":           {},
+	"Te":                  {},
+	"Trailer":             {},
+	"Transfer-Encoding":   {},
+	"Upgrade":             {},
 }
 
 func isHopByHop(k string) bool {
