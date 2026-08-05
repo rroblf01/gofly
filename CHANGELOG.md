@@ -1,5 +1,22 @@
 # Changelog
 
+## v1.1.2 (2026-08-05)
+
+### Performance
+
+- **Fewer allocations on the static cache hot path** — `cacheEntry` now precomputes the `Content-Type`/`Content-Length`/`Etag`/`Last-Modified` header slices once when a file is cached, instead of building a new `[]string{...}` for each on every hit; `Cache-Control` and `set_headers` are precomputed the same way on the `Handler`. Cuts `serveCached` from 14 to **10 allocs/op** (`BenchmarkCacheHit`: ~2.3 µs → ~1.85 µs).
+- **Reverse proxy: one fewer string build and one fewer full var-scan per request** — `UpstreamState` precomputes `url.String()` once in `New()` instead of reconstructing it on every proxied request for the `UpstreamSetter`/logging hook; `expandVars` now short-circuits on a literal (no `$`) instead of running five `strings.Contains`/`ReplaceAll` passes. Reverse-proxy benchmarks (`BenchmarkProxy_SingleUpstream`/`MultipleUpstreams`) drop from ~34-37 µs/op to ~29-30 µs/op.
+
+### Chores
+
+- **Go toolchain pinned to 1.26.5** — `go.mod` and the `Dockerfile` base image (`golang:1.26.5-alpine`, was the floating `golang:1.26-alpine` tag) are now pinned to a specific patch version for reproducible builds.
+
+### Documentation
+
+- **Re-measured every benchmark figure** in the Performance section against real `nginx:alpine` and gofly containers (Docker, `--network host`, `wrk`) on the same machine as before. Notably: the in-memory static cache (`static_cache_ttl`) now measures *faster* than no-cache even on a single hot file (194k vs 92k req/s) — superseding the previous "leave it off for a hot file" advice, which no longer holds on current code.
+- **Corrected the nginx memory comparison.** The previous ~58 MB nginx figure was a naive `ps aux` RSS sum across nginx's 13 worker processes, which double-counts shared library pages (libc, PCRE, zlib, OpenSSL) mapped once physically but reported per process. Measured via cgroup `memory.current` (`docker stats`) — the number that actually counts against a container memory limit — nginx uses **~13 MB** for the same workload; gofly's own footprint (single-process, so both methods agree for it) is now honestly ~2× nginx's instead of the previously claimed ~3× smaller.
+- **Documented that Go 1.25+ already sets `GOMAXPROCS` from the container's cgroup CPU quota** (`GODEBUG=containermaxprocs`, on by default) — verified directly (`docker run --cpus=2 golang:1.26.5-alpine`). `max_procs` remains useful to cap *below* a generous/unlimited quota to trade throughput for a smaller footprint, not to work around a container-detection gap.
+
 ## v1.1.1 (2026-06-02)
 
 ### Fixes

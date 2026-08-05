@@ -369,7 +369,7 @@ make docker
 ### Multi-stage build
 
 The Dockerfile uses:
-1. `golang:1.26-alpine` — builder stage (CA certs, compilation)
+1. `golang:1.26.5-alpine` — builder stage (CA certs, compilation)
 2. `scratch` — final stage (~7 MB image)
 
 Supports multi-arch builds:
