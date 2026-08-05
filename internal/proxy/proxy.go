@@ -134,6 +134,7 @@ func singleJoiningSlash(a, b string) string {
 
 type UpstreamState struct {
 	url       *url.URL
+	urlStr    string // url.String(), precomputed once since url never changes after New()
 	index     int
 	failCount int32
 	lastFail  int64
@@ -175,7 +176,7 @@ func New(route config.Route) (*Proxy, error) {
 		if err != nil {
 			return nil, err
 		}
-		state := &UpstreamState{url: parsed, index: i}
+		state := &UpstreamState{url: parsed, urlStr: parsed.String(), index: i}
 		p.upstreams = append(p.upstreams, state)
 	}
 
@@ -237,7 +238,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if us, ok := w.(UpstreamSetter); ok {
-		us.SetUpstream(up.url.String())
+		us.SetUpstream(up.urlStr)
 	}
 
 	atomic.AddInt32(&up.inFlight, 1)
@@ -559,6 +560,9 @@ func (p *Proxy) serveWebSocket(w http.ResponseWriter, r *http.Request, target *u
 }
 
 func expandVars(val string, r *http.Request) string {
+	if strings.IndexByte(val, '$') < 0 {
+		return val
+	}
 	if strings.Contains(val, "$remote_addr") {
 		val = strings.ReplaceAll(val, "$remote_addr", r.RemoteAddr)
 	}

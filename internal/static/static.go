@@ -37,7 +37,9 @@ type Handler struct {
 	root          string
 	prefix        string
 	cacheTTL      string
+	cacheTTLHdr   []string
 	setHeaders    map[string]string
+	setHeadersHdr map[string][]string
 	spa           bool
 	autoindex     bool
 	errorPages    map[int]string
@@ -65,6 +67,13 @@ func New(route config.Route) *Handler {
 	}
 	if route.BrowserCacheTTL != nil {
 		h.cacheTTL = "public, max-age=" + strconv.FormatInt(int64(route.BrowserCacheTTL.Seconds()), 10)
+		h.cacheTTLHdr = []string{h.cacheTTL}
+	}
+	if len(h.setHeaders) > 0 {
+		h.setHeadersHdr = make(map[string][]string, len(h.setHeaders))
+		for k, v := range h.setHeaders {
+			h.setHeadersHdr[http.CanonicalHeaderKey(k)] = []string{v}
+		}
 	}
 	if route.StaticCacheTTL != nil && route.StaticCacheTTL.Duration > 0 {
 		h.cache = newFileCache(route.StaticCacheTTL.Duration, route.EffectiveStaticCacheMaxBytes())
@@ -212,14 +221,14 @@ func (h *Handler) serveAndMaybeCache(w http.ResponseWriter, r *http.Request, f *
 	if ctype == "" {
 		ctype = http.DetectContentType(data)
 	}
-	e := &cacheEntry{
-		modTime: stat.ModTime(),
-		etag:    etagFor(stat),
-		ctype:   ctype,
-		lastMod: stat.ModTime().UTC().Format(http.TimeFormat),
-		sizeStr: strconv.FormatInt(int64(len(data)), 10),
-		data:    data,
-	}
+	e := newCacheEntry(
+		stat.ModTime(),
+		etagFor(stat),
+		ctype,
+		stat.ModTime().UTC().Format(http.TimeFormat),
+		strconv.FormatInt(int64(len(data)), 10),
+		data,
+	)
 	h.cache.put(origName, e)
 	h.serveCached(w, r, e)
 }
@@ -252,7 +261,7 @@ func (h *Handler) serveContent(w http.ResponseWriter, r *http.Request, src io.Re
 			hdr["Etag"] = []string{etag}
 			hdr["Last-Modified"] = []string{lastMod}
 			if h.cacheTTL != "" {
-				hdr["Cache-Control"] = []string{h.cacheTTL}
+				hdr["Cache-Control"] = h.cacheTTLHdr
 			}
 			w.WriteHeader(http.StatusNotModified)
 			return
@@ -265,7 +274,7 @@ func (h *Handler) serveContent(w http.ResponseWriter, r *http.Request, src io.Re
 			hdr["Etag"] = []string{etag}
 			hdr["Last-Modified"] = []string{lastMod}
 			if h.cacheTTL != "" {
-				hdr["Cache-Control"] = []string{h.cacheTTL}
+				hdr["Cache-Control"] = h.cacheTTLHdr
 			}
 			w.WriteHeader(http.StatusNotModified)
 			return
@@ -294,15 +303,15 @@ func (h *Handler) serveContent(w http.ResponseWriter, r *http.Request, src io.Re
 	hdr["Accept-Ranges"] = acceptRangesHeader
 
 	if h.cacheTTL != "" {
-		hdr["Cache-Control"] = []string{h.cacheTTL}
+		hdr["Cache-Control"] = h.cacheTTLHdr
 	}
 	if h.secHeaders {
 		hdr["X-Content-Type-Options"] = nosniffHeader
 		hdr["X-Frame-Options"] = denyFrameHeader
 		hdr["Referrer-Policy"] = referrerHeader
 	}
-	for k, v := range h.setHeaders {
-		hdr[http.CanonicalHeaderKey(k)] = []string{v}
+	for k, v := range h.setHeadersHdr {
+		hdr[k] = v
 	}
 
 	w.WriteHeader(http.StatusOK)
@@ -336,21 +345,21 @@ func (h *Handler) serveCached(w http.ResponseWriter, r *http.Request, e *cacheEn
 	}
 
 	hdr := w.Header()
-	hdr["Content-Type"] = []string{e.ctype}
-	hdr["Content-Length"] = []string{e.sizeStr}
-	hdr["Etag"] = []string{e.etag}
-	hdr["Last-Modified"] = []string{e.lastMod}
+	hdr["Content-Type"] = e.ctypeHdr
+	hdr["Content-Length"] = e.sizeHdr
+	hdr["Etag"] = e.etagHdr
+	hdr["Last-Modified"] = e.lastModHdr
 	hdr["Accept-Ranges"] = acceptRangesHeader
 	if h.cacheTTL != "" {
-		hdr["Cache-Control"] = []string{h.cacheTTL}
+		hdr["Cache-Control"] = h.cacheTTLHdr
 	}
 	if h.secHeaders {
 		hdr["X-Content-Type-Options"] = nosniffHeader
 		hdr["X-Frame-Options"] = denyFrameHeader
 		hdr["Referrer-Policy"] = referrerHeader
 	}
-	for k, v := range h.setHeaders {
-		hdr[http.CanonicalHeaderKey(k)] = []string{v}
+	for k, v := range h.setHeadersHdr {
+		hdr[k] = v
 	}
 
 	w.WriteHeader(http.StatusOK)
@@ -362,7 +371,7 @@ func (h *Handler) write304(w http.ResponseWriter, etag, lastMod string) {
 	hdr["Etag"] = []string{etag}
 	hdr["Last-Modified"] = []string{lastMod}
 	if h.cacheTTL != "" {
-		hdr["Cache-Control"] = []string{h.cacheTTL}
+		hdr["Cache-Control"] = h.cacheTTLHdr
 	}
 	w.WriteHeader(http.StatusNotModified)
 }
@@ -412,8 +421,8 @@ func (h *Handler) serveRange(w http.ResponseWriter, r *http.Request, src io.Read
 	if h.secHeaders {
 		hdr["X-Content-Type-Options"] = nosniffHeader
 	}
-	for k, v := range h.setHeaders {
-		hdr[http.CanonicalHeaderKey(k)] = []string{v}
+	for k, v := range h.setHeadersHdr {
+		hdr[k] = v
 	}
 
 	w.WriteHeader(http.StatusPartialContent)
@@ -584,6 +593,30 @@ type cacheEntry struct {
 	lastMod string
 	sizeStr string
 	data    []byte
+
+	// ctypeHdr, sizeHdr, etagHdr and lastModHdr are the single-element header
+	// slices for the fields above, built once here instead of on every cache
+	// hit — serveCached assigns them straight into w.Header() with no
+	// per-request []string{...} allocation.
+	ctypeHdr   []string
+	sizeHdr    []string
+	etagHdr    []string
+	lastModHdr []string
+}
+
+func newCacheEntry(modTime time.Time, etag, ctype, lastMod, sizeStr string, data []byte) *cacheEntry {
+	return &cacheEntry{
+		modTime:    modTime,
+		etag:       etag,
+		ctype:      ctype,
+		lastMod:    lastMod,
+		sizeStr:    sizeStr,
+		data:       data,
+		ctypeHdr:   []string{ctype},
+		sizeHdr:    []string{sizeStr},
+		etagHdr:    []string{etag},
+		lastModHdr: []string{lastMod},
+	}
 }
 
 // maxCacheEntries bounds the number of distinct files held in memory. It is a
