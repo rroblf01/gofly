@@ -591,8 +591,8 @@ func cloneMap(m map[string]string) map[string]string {
 // parseListenPort extracts the port from an nginx listen argument such as
 // "80", "0.0.0.0:8080", "[::]:443", or "443".
 func parseListenPort(s string) int {
-	if i := strings.LastIndex(s, ":"); i >= 0 {
-		s = s[i+1:]
+	if _, after, ok := strings.CutLast(s, ":"); ok {
+		s = after
 	}
 	if n, err := strconv.Atoi(s); err == nil {
 		return n

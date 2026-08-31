@@ -266,20 +266,17 @@ func (p *Proxy) serveHTTP(w http.ResponseWriter, r *http.Request, up *UpstreamSt
 		}
 
 		target := up.url
-		out.URL.Scheme = target.Scheme
-		out.URL.Host = target.Host
-		out.URL.Path = singleJoiningSlash(target.Path, r.URL.Path)
-		out.URL.RawPath = ""
-
+		// Go 1.27: url.URL.Clone() clones User, Scheme, Host etc. in one call.
+		// Then override Path/RawQuery with the joined path.
+		cloned := target.Clone()
+		cloned.Path = singleJoiningSlash(target.Path, r.URL.Path)
+		cloned.RawPath = ""
 		if target.RawQuery == "" || r.URL.RawQuery == "" {
-			out.URL.RawQuery = target.RawQuery + r.URL.RawQuery
+			cloned.RawQuery = target.RawQuery + r.URL.RawQuery
 		} else {
-			out.URL.RawQuery = target.RawQuery + "&" + r.URL.RawQuery
+			cloned.RawQuery = target.RawQuery + "&" + r.URL.RawQuery
 		}
-
-		if pw, ok := target.User.Password(); ok {
-			out.SetBasicAuth(target.User.Username(), pw)
-		}
+		out.URL = cloned
 
 		p.applyDirector(out)
 
@@ -310,8 +307,6 @@ func (p *Proxy) serveHTTP(w http.ResponseWriter, r *http.Request, up *UpstreamSt
 			http.Error(w, "bad gateway", http.StatusBadGateway)
 			return
 		}
-		defer resp.Body.Close()
-
 		for k, v := range resp.Header {
 			if !isHopByHop(k) {
 				w.Header()[k] = v
@@ -323,6 +318,7 @@ func (p *Proxy) serveHTTP(w http.ResponseWriter, r *http.Request, up *UpstreamSt
 		// io.Copy detects WriterTo on http.Response.Body (Go 1.20+) and may
 		// use splice(2) for zero-copy TCP forwarding on Linux.
 		io.Copy(w, resp.Body)
+		resp.Body.Close()
 		return
 	}
 }

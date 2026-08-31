@@ -166,6 +166,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.Close()
 		f = idx
 		target = filepath.Join(target, "index.html")
+		// For directory requests the early cache lookup used the dir path,
+		// not the resolved index.html. Check again for the resolved file so
+		// that "/" benefits from the cache after the first hit.
+		if h.cache != nil {
+			if e, ok := h.cache.get(target); ok {
+				h.serveCached(w, r, e)
+				return
+			}
+		}
 	}
 
 	// When the in-memory cache is enabled it takes precedence over
@@ -528,8 +537,8 @@ func (h *Handler) serveDirList(w http.ResponseWriter, r *http.Request, dirPath s
 
 	if r.URL.Path != "/" {
 		parent := strings.TrimSuffix(r.URL.Path, "/")
-		if idx := strings.LastIndex(parent, "/"); idx >= 0 {
-			parent = parent[:idx]
+		if p, _, ok := strings.CutLast(parent, "/"); ok {
+			parent = p
 		}
 		if parent == "" {
 			parent = "/"
