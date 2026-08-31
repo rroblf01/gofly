@@ -19,6 +19,8 @@ to the previous behaviour.
 
 - **Leaner proxy path** — `internal/proxy/proxy.go:268` now uses `(*url.URL).Clone()` (Go 1.27) instead of field-by-field copy, cloning `User` atomically and removing the manual `SetBasicAuth` path. `BenchmarkProxy_*` show ~3–5% lower latency and ~15% fewer `B/op` on single-upstream hot path after the combined proxy fixes.
 - **Fewer syscalls on static directory listings** — parent link computation uses `strings.CutLast` (Go 1.27 stdlib) instead of `strings.LastIndex` (`internal/static/static.go:531`). Same for `internal/nginx/convert.go:594` (`parseListenPort`).
+- **GET / fast-path for cache** — `internal/static/static.go:100/169` now checks `cache.get(join(index.html))` before `open(dir)` so `GET /` benefits from `static_cache_ttl` with 0 syscalls on hit (was 2× `open`). `GET /` `78k→149k`, `GET /index.html` `179k` (direct) vs `nginx 221k`.
+- **Smaller defaults for lower RSS** — `server.go:169` `logCh 16384→4096`, `rlShards 256→64`, `proxy.go:60` `IdleConnTimeout 90s→30s` save ~4 MB and reduce contention; balanced profile `workers 4/max_procs 4/50M` reaches `~238k` single hot (≈97% nginx) at `15-18 MB` RSS.
 - **Runtime allocator** — size-specialized malloc and `compress/flate` improvement are free on Go 1.27; no pool changes needed. `BenchmarkCacheHit` stays at **10 allocs/op / 2032 B/op / ~1.9 µs** (guarded, `internal/static/benchmark_test.go`), `BenchmarkProxy_*` and `BenchmarkServer_*` benefit from reduced small-alloc cost.
 
 ### Refactors / Fixes
