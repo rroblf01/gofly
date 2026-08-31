@@ -38,7 +38,7 @@ run: build
 	$(BUILD_DIR)/$(BINARY) -config config.json -debug
 
 lint:
-	go vet ./...
+	go vet -stdversion ./...
 
 cross:
 	GOOS=linux GOARCH=amd64 go build $(GOFLAGS) -o $(BUILD_DIR)/$(BINARY)-linux-amd64 ./cmd/gofly/

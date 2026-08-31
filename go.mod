@@ -1,3 +1,3 @@
 module github.com/rroblf01/gofly
 
-go 1.26.5
+go 1.27
