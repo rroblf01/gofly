@@ -23,22 +23,23 @@ const (
 const DefaultStaticCacheMaxBytes int64 = 64 << 20 // 64 MiB
 
 type Config struct {
-	Port              int        `json:"port"`
-	Workers           int        `json:"workers,omitempty"`
-	ReadTimeout       Duration   `json:"read_timeout,omitempty"`
-	WriteTimeout      Duration   `json:"write_timeout,omitempty"`
-	IdleTimeout       Duration   `json:"idle_timeout,omitempty"`
-	MaxBodySize       int64      `json:"max_body_size,omitempty"`
-	RateLimit         *RateLimit `json:"rate_limit,omitempty"`
-	TLS               *TLSConfig `json:"tls,omitempty"`
-	AccessLog         *bool      `json:"access_log,omitempty"`
-	MemoryLimit       int64      `json:"memory_limit,omitempty"`
-	GOGC              int        `json:"gogc,omitempty"`
-	Metrics           *bool      `json:"metrics,omitempty"`
-	TrustForwardedFor *bool      `json:"trust_forwarded_for,omitempty"`
-	MaxProcs          int        `json:"max_procs,omitempty"`
-	Upstream          *Upstream  `json:"upstream,omitempty"`
-	Routes            []Route    `json:"routes"`
+	Port                int        `json:"port"`
+	Workers             int        `json:"workers,omitempty"`
+	ReadTimeout         Duration   `json:"read_timeout,omitempty"`
+	WriteTimeout        Duration   `json:"write_timeout,omitempty"`
+	IdleTimeout         Duration   `json:"idle_timeout,omitempty"`
+	MaxBodySize         int64      `json:"max_body_size,omitempty"`
+	RateLimit           *RateLimit `json:"rate_limit,omitempty"`
+	TLS                 *TLSConfig `json:"tls,omitempty"`
+	AccessLog           *bool      `json:"access_log,omitempty"`
+	MemoryLimit         int64      `json:"memory_limit,omitempty"`
+	GOGC                int        `json:"gogc,omitempty"`
+	Metrics             *bool      `json:"metrics,omitempty"`
+	TrustForwardedFor   *bool      `json:"trust_forwarded_for,omitempty"`
+	MaxProcs            int        `json:"max_procs,omitempty"`
+	Upstream            *Upstream  `json:"upstream,omitempty"`
+	MaxHeaderValueCount int        `json:"max_header_value_count,omitempty"`
+	Routes              []Route    `json:"routes"`
 }
 
 // Upstream tunes the shared HTTP transport used for every proxy route. Smaller
@@ -229,6 +230,9 @@ func (c *Config) validate() error {
 
 	if c.MaxProcs < 0 {
 		return fmt.Errorf("max_procs must be non-negative")
+	}
+	if c.MaxHeaderValueCount < 0 {
+		return fmt.Errorf("max_header_value_count must be non-negative")
 	}
 	if c.Upstream != nil {
 		if c.Upstream.MaxIdleConns < 0 {

@@ -18,7 +18,7 @@ import (
 // version is set at build time via -ldflags "-X main.version=...". The default
 // is the current release, so `-version` is correct even for builds that don't
 // inject it (plain `go build`/`go run`, or a Docker build without the VERSION arg).
-var version = "1.1.1"
+var version = "1.2.0"
 
 func main() {
 	configPath := flag.String("config", "", "path to config file")

@@ -12,6 +12,7 @@ import (
 	"os/signal"
 	"runtime"
 	"runtime/debug"
+	"runtime/pprof"
 	"strconv"
 	"strings"
 	"sync"
@@ -178,13 +179,14 @@ func New(cfg config.Config) *Server {
 	s.startHealthChecks()
 
 	s.http = &http.Server{
-		Addr:              fmt.Sprintf(":%d", cfg.Port),
-		Handler:           handler,
-		ReadTimeout:       cfg.ReadTimeout.Duration,
-		ReadHeaderTimeout: cfg.ReadTimeout.Duration,
-		WriteTimeout:      cfg.WriteTimeout.Duration,
-		IdleTimeout:       cfg.IdleTimeout.Duration,
-		ErrorLog:          logger.StdLogger(),
+		Addr:                fmt.Sprintf(":%d", cfg.Port),
+		Handler:             handler,
+		ReadTimeout:         cfg.ReadTimeout.Duration,
+		ReadHeaderTimeout:   cfg.ReadTimeout.Duration,
+		WriteTimeout:        cfg.WriteTimeout.Duration,
+		IdleTimeout:         cfg.IdleTimeout.Duration,
+		ErrorLog:            logger.StdLogger(),
+		MaxHeaderValueCount: cfg.MaxHeaderValueCount,
 	}
 
 	return s
@@ -315,7 +317,6 @@ func (s *Server) registerRoutes() {
 	}
 
 	for _, route := range s.cfg.Routes {
-		route := route
 		var h http.Handler
 		switch {
 		case route.StaticDir != "":
@@ -370,6 +371,12 @@ func (s *Server) registerRoutes() {
 
 	if s.cfg.MetricsEnabled() {
 		s.mux.HandleFunc("GET /metrics", s.metricsHandler)
+		// Go 1.27: goroutineleak profile is now generally available.
+		// Exposed alongside /metrics when metrics are enabled.
+		s.mux.HandleFunc("GET /debug/pprof/goroutineleak", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			_ = pprof.Lookup("goroutineleak").WriteTo(w, 1)
+		})
 	}
 }
 
