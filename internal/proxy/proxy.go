@@ -57,7 +57,7 @@ func newTransport(responseHeaderTimeout time.Duration) *http.Transport {
 		MaxIdleConns:          tuning.maxIdleConns,
 		MaxIdleConnsPerHost:   tuning.maxIdleConnsPerHost,
 		MaxConnsPerHost:       0,
-		IdleConnTimeout:       90 * time.Second,
+		IdleConnTimeout:       30 * time.Second,
 		WriteBufferSize:       tuning.bufferSize,
 		ReadBufferSize:        tuning.bufferSize,
 		TLSClientConfig:       &tls.Config{InsecureSkipVerify: false},

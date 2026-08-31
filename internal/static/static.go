@@ -102,6 +102,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			h.serveCached(w, r, e)
 			return
 		}
+		if strings.HasSuffix(r.URL.Path, "/") {
+			idx := filepath.Join(target, "index.html")
+			if e, ok := h.cache.get(idx); ok {
+				h.serveCached(w, r, e)
+				return
+			}
+		}
 	}
 
 	f, err := os.Open(target)

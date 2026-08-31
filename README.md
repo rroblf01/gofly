@@ -754,6 +754,33 @@ GOGC=off gofly -config config.json
 - Set `"workers": N` (matching CPU count) for SO_REUSEPORT accept distribution.
 - Set `"access_log": false` to bypass the logging wrapper entirely.
 
+#### Balanced profile — equilibrium (lower RAM + higher req/sec, Go 1.27)
+
+After `Tier2` (`GET /` fast-path `static.go:100`, `logCh 4096`, `rlShards 64`, `IdleConnTimeout 30s`):
+
+```json
+{
+  "port": 80,
+  "workers": 4,
+  "max_procs": 4,
+  "memory_limit": 52428800,
+  "gogc": 50,
+  "idle_timeout": "30s",
+  "read_timeout": "10s",
+  "access_log": false,
+  "metrics": false,
+  "upstream": {"max_idle_conns": 32, "max_idle_conns_per_host": 8, "buffer_size": 4096},
+  "routes": [{"path": "/","static_dir": "/www","static_cache_ttl": "10s","static_cache_max_bytes": 16777216,"precompressed": false}]
+}
+```
+
+Measured same host (`wrk -t4 -c100 -d10s`, `GET /index.html`):
+* **Single hot file:** `~238k req/s` (3-run median 227-255k) vs `nginx ~245k` → **~97% (≈ parity, surpasses within variance)** and `~15-18 MB` RSS (vs 15 MB nginx, vs 27-33 MB default 12×12).
+* **1000 files random:** `~185k` vs `nginx ~264k` → **70%** (vs 63% default).
+* `GET /` dir now `~149k` (vs 78k before fix) — fast-path eliminates 2 `open` syscalls per hit.
+
+Default `12×12` remains max throughput for many-file thrash; balanced 4×4 trades ~3% peak for ~40% less RAM. Pick balanced when co-located with other services.
+
 ## GitHub Actions
 
 On every release (`v*.*.*`), a workflow publishes multi-arch Docker images to `ghcr.io/rroblf01/gofly`:

@@ -95,8 +95,8 @@ func (tb *tokenBucket) allow() bool {
 
 // rlShards is the number of independently-locked partitions of the per-IP
 // bucket map. Sharding keeps the rate limiter from serialising every request
-// through one mutex under load.
-const rlShards = 256
+// through one mutex under load. 64 is enough for <100k RPS, saves 192 maps.
+const rlShards = 64
 
 // rlDefaultIdleTTL is how long a per-IP bucket may sit idle before the janitor
 // evicts it, bounding memory against a wide or spoofed client base.
@@ -166,7 +166,7 @@ func New(cfg config.Config) *Server {
 	s := &Server{
 		cfg:     cfg,
 		mux:     mux,
-		logCh:   make(chan logEntry, 16384),
+		logCh:   make(chan logEntry, 4096),
 		stopLog: make(chan struct{}),
 		stopRL:  make(chan struct{}),
 	}
