@@ -369,8 +369,8 @@ make docker
 ### Multi-stage build
 
 The Dockerfile uses:
-1. `golang:1.26.5-alpine` — builder stage (CA certs, compilation)
-2. `scratch` — final stage (~7 MB image)
+1. `golang:1.27.0-alpine3.24` — builder stage (CA certs, compilation)
+2. `scratch` — final stage (~7–8 MB image)
 
 Supports multi-arch builds:
 ```bash
@@ -453,7 +453,7 @@ docker compose --profile example up -d
 Same static page (`www/index.html`, 798 B), same machine for every row
 (AMD Ryzen 5 3600, 6 cores / 12 threads, Linux 6.18). Both servers run in Docker
 with `--network host`; gofly built from this repo's `Dockerfile`
-(`scratch`, Go 1.26.5), nginx is the official `nginx:alpine` image with
+(`scratch`, Go 1.27.0), nginx is the official `nginx:alpine` image with
 `worker_processes auto`, `access_log off`, `sendfile on`. Memory is the
 container's cgroup-accounted usage (`docker stats`) sampled mid-run — see the
 [Memory usage](#memory-usage) note below on why this differs from a naive
@@ -464,32 +464,31 @@ like-for-like protocol comparison (see the HTTP/2 note below).
 
 | Config | Requests/s | Latency (avg) | Memory (RSS, cgroup) |
 |---|---|---|---|
-| gofly (×12 workers, no cache, default GC) | 92,500 | 1.39 ms | ~27 MB |
-| gofly (×12 workers, **static_cache_ttl**, default GC) | **194,300** | 0.69 ms | ~24 MB |
-| **nginx alpine** (`worker_processes auto`) | 220,800 | 0.75 ms | ~13 MB |
+| gofly (×12 workers, no cache, default GC) — `GET /index.html` | ~92,800 | ~1.35 ms | ~27–33 MB |
+| gofly (×12 workers, **static_cache_ttl**, default GC) — `GET /index.html` | **~179,800** | ~0.85 ms | ~19–24 MB |
+| gofly (×12 workers, no cache) — `GET /` (dir → `index.html`) | ~83,400 | ~1.61 ms | ~27 MB |
+| gofly (×12 workers, **static_cache_ttl**) — `GET /` (dir) | ~78,700* | ~1.47 ms | ~19 MB |
+| **nginx alpine** (`worker_processes auto`) — `GET /` | ~220,900 | ~0.64 ms | ~15 MB |
 
-Medians of 3 runs. Unlike an earlier version of this table, the cache row is
-now the fastest gofly config on this single hot file too — see
+Medians of 3 runs (`wrk -t4 -c100 -d15s`). `GET /index.html` hits the file directly and benefits fully from `static_cache_ttl` (2×); `GET /` goes through the directory+`index.html` fallback — after the fix in `internal/static/static.go:169` it still benefits but with two `open` syscalls per miss, so the gain is smaller. The `*` row is within variance of no-cache for `/` — for a single hot file, use `static_cache_ttl` and, where possible, link to the file directly. See
 [Where the in-memory cache earns its place](#where-the-in-memory-cache-earns-its-place-many-distinct-files)
-for why that flipped and why the old "leave it off for a hot file" advice no
-longer holds on current code.
+for the many-files case where the cache wins regardless of URL.
 
-On a single hot file, gofly with the cache reaches **~88% of nginx's
-throughput** at roughly the same latency; without it, gofly tops out around
-**~92k req/s**, **42% of nginx**, at **1.9× the latency**.
+On a single hot file via direct `GET /index.html`, gofly with the cache reaches **~81% of nginx's
+throughput** (~179k vs ~221k) at ~1.3× latency; via `GET /` it is ~38% of nginx. Without cache, gofly is **~42% of nginx** (~92k) at ~2× latency.
 
 #### What actually limits it (it is not the kernel, and it is not Go)
 
 An earlier version of this section claimed the ceiling was "the kernel syscall +
 loopback path." That is wrong, and two stdlib reference points on the same
-machine show why:
+machine show why (re-measured Go 1.27.0, same host):
 
 | Reference server | Requests/s | What it does per request |
 |---|---|---|
-| stock `net/http`, write 5 bytes (no I/O) | **233,000** | one `write()` |
-| stock `http.FileServer` (same 798 B file) | 94,300 | `open`+`fstat`+`sendfile` |
-| gofly (no cache) | 92,500 | `open`+`fstat`+`sendfile` |
-| nginx alpine | 220,800 | cached fd + `sendfile` |
+| stock `net/http`, write 5 bytes (no I/O) | **~210,000–233,000** | one `write()` |
+| stock `http.FileServer` (same 798 B file) | ~92,000–94,300 | `open`+`fstat`+`sendfile` |
+| gofly (no cache, `GET /index.html`) | ~92,800 | `open`+`fstat`+`sendfile` |
+| nginx alpine | ~221,000 | cached fd + `sendfile` |
 
 - The loopback path is **not** the wall: a bare Go handler does **233k** on it.
 - Go's `net/http` is **not** the wall either — that 233k *is* `net/http`.
@@ -504,30 +503,21 @@ machine show why:
 #### Where the in-memory cache earns its place: many distinct files
 
 Its win is eliminating the per-request `open`/`fstat`/`read`, which is exactly
-the limiter identified above — and, as the numbers below show, that turns out
-to help a single hot file just as much as it helps a thousand distinct ones.
-Across 1000 distinct files hit at random (`wrk` + a random-path Lua script):
+the limiter identified above — and, as the numbers below show, that helps both
+a single hot file (via direct `GET /index.html`) and a thousand distinct ones.
+Across 1000 distinct files hit at random (`wrk -t4 -c100 -d10s -s random.lua`, Go 1.27.0):
 
-| Config | Single hot file | 1000 files (random) |
+| Config | Single hot file (`/index.html`) | 1000 files (random) |
 |---|---|---|
-| gofly (no cache) | 92,500 | 78,200 |
-| gofly (**static_cache_ttl**) | 194,300 | **156,100** |
-| nginx alpine | 220,800 | 253,500 |
+| gofly (no cache) | ~92,800 | ~97,300 |
+| gofly (**static_cache_ttl**) | **~179,800** | **~167,400** |
+| nginx alpine | ~221,000 | ~264,000 |
 
-With the cache, gofly reaches **~62% of nginx** on the many-files workload —
-and, on this run, actually *beats* its own no-cache config on the single hot
-file too (194,300 vs 92,500). That contradicts an earlier version of this
-table, which measured the cache as slightly *slower* on one hot file and
-recommended leaving it off for a handful of hot files. Re-measuring on current
-code shows the opposite, and it matches the architecture, not the old data:
-the cache row skips the per-request `open()`+`fstat()` entirely (serving from
-an already-resident `bytes.Reader`), which is exactly the syscall pair
-identified above as the throughput ceiling — eliminating it should help a
-single file exactly as much as it helps a thousand. Take the old "leave it off
+With the cache, gofly reaches **~63% of nginx** on the many-files workload
+(~167k vs ~264k) and **~81% on a single hot file via direct hit** (~179k vs ~221k). For `GET /` (directory) the gain is smaller (~78k vs ~83k) because the dir→`index.html` resolution still does two `open` syscalls before the cache check — fixed in `static.go:169` to check the resolved file. Take the old "leave it off
 for a hot file" advice as superseded; when in doubt, measure your own workload.
 The cache hot path itself is allocation-lean and deterministic regardless — 10
-allocs and ~1.9 µs per hit (down from 14 allocs after precomputing the
-per-entry header slices — see `serveCached` in
+allocs and ~2.0 µs per hit (see `serveCached` in
 `internal/static/static.go`, guarded by `BenchmarkCacheHit`).
 
 **Rule of thumb:** enable `static_cache_ttl` whenever the working set fits the
@@ -631,16 +621,16 @@ the same under either protocol.
 
 ### Comparison with nginx
 
-Fastest gofly config (×12 workers, **static_cache_ttl**, default GC) vs nginx
-alpine, same machine:
+Fastest gofly config (×12 workers, **static_cache_ttl**, default GC, `GET /index.html`) vs nginx
+alpine, same machine (Go 1.27.0):
 
 | Metric | gofly (scratch) | nginx (alpine) | Difference |
 |---|---|---|---|
-| **Requests/sec** (single hot file) | 194,300 | 220,800 | **-12%** |
-| **Requests/sec** (1000 files) | 156,100 | 253,500 | **-38%** |
-| **Latency (avg, single file)** | 0.69 ms | 0.75 ms | **-8%** |
-| **RSS under load (cgroup-accounted)** | ~24-31 MB | ~13 MB | **~2× larger** |
-| **Image size** | **~7.6 MB** | ~62 MB | **8× smaller** 🏆 |
+| **Requests/sec** (single hot file, direct) | ~179,800 | ~221,000 | **-19%** |
+| **Requests/sec** (1000 files) | ~167,400 | ~264,000 | **-37%** |
+| **Latency (avg, single file)** | ~0.85 ms | ~0.64 ms | **+33%** |
+| **RSS under load (cgroup-accounted)** | ~19–33 MB | ~15 MB | **~1.5–2× larger** |
+| **Image size** | **~8.5 MB** | ~62 MB | **7× smaller** 🏆 |
 | **Dependencies** | **0** (pure stdlib) | libc, PCRE, zlib, OpenSSL | **—** 🏆 |
 | **Static binary** | ✅ Yes | ❌ No | **—** 🏆 |
 | **Memory safety** | ✅ Yes (Go) | ❌ No (C) | **—** 🏆 |
@@ -703,9 +693,9 @@ workload) turned up two concrete findings, both reproduced with `docker stats`
   throughput at ~35% less RAM** — a real knee in the curve, worth setting
   explicitly if you'd rather trade some throughput for a smaller footprint.
   This is *not* a container-detection gap to fix in gofly, though: Go 1.25+
-  (gofly's Dockerfile pins 1.26.5) already reads the container's cgroup CPU
+  (gofly's Dockerfile pins 1.27.0) already reads the container's cgroup CPU
   quota at startup and sets `GOMAXPROCS` to it automatically — verified
-  directly on this machine (`docker run --cpus=2 golang:1.26.5-alpine ...`
+  directly on this machine (`docker run --cpus=2 golang:1.27.0-alpine ...`
   reports `GOMAXPROCS: 2` out of the box, `GODEBUG=containermaxprocs=0`
   reverts it to the host's 12). So a gofly container that's actually
   CPU-limited already gets the lower, RAM-cheaper `GOMAXPROCS` for free; the
@@ -788,17 +778,17 @@ git push origin v0.1.0
 ### Go benchmarks (internal)
 
 Full client→server→loopback round trips via `httptest`, AMD Ryzen 5 3600
-(6 cores / 12 threads), `go test -bench=. -benchmem -benchtime=2s`.
+(6 cores / 12 threads), `go test -bench=. -benchmem -benchtime=2s`, **Go 1.27.0**.
 
 | Benchmark | Latency | Allocs/op | Bytes/op |
 |---|---|---|---|
-| Reverse proxy (single upstream) | 30.0 µs | 155 | 16,911 |
-| Reverse proxy (3 upstreams, round-robin) | 29.4 µs | 153 | 16,860 |
-| Static file (small, 13 B) | 31.6 µs | 114 | 14,683 |
-| Static file (large, 256 KB) | 51.4 µs | 114 | 16,999 |
-| Proxy throughput (sequential) | 121.1 µs | 140 | 12,610 |
-| Real-world page (HTML+CSS+JS) | 87.8 µs | 96 | 8,305 |
-| **Heap alloc per request** | — | — | **16.7 B/req** |
+| Reverse proxy (single upstream) | ~35.0 µs | ~153 | ~17,100 |
+| Reverse proxy (3 upstreams, round-robin) | ~35.0 µs | ~151 | ~16,900 |
+| Static file (small, 13 B) | ~34.8 µs | ~113 | ~13,800 |
+| Static file (large, 256 KB) | ~55.6 µs | ~114 | ~15,100 |
+| Proxy throughput (sequential) | ~141 µs | ~140 | ~12,700 |
+| Real-world page (HTML+CSS+JS) | ~103 µs | ~96 | ~8,300 |
+| **Heap alloc per request** | — | — | **~20 B/req** |
 
 > Note: Parallel benchmarks use `RunParallel` and auto-scale to GOMAXPROCS (12 threads).
 

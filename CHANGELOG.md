@@ -1,5 +1,33 @@
 # Changelog
 
+## v1.2.0 (2026-08-31)
+
+Backwards-compatible within `1.x`: all new config fields are optional and default
+to the previous behaviour.
+
+### Toolchain
+
+- **Go 1.27** — `go.mod` `go 1.27`, `Dockerfile` `golang:1.27.0-alpine3.24`, CI `setup-go 1.27`. `go vet` now runs as `go vet -stdversion ./...` (also in `Makefile:lint`) to catch use of stdlib symbols newer than the `go` directive. `gofmt` check unchanged. Verified via `go vet -stdversion`, `gofmt -l`, `go test -race -count=1`, `gofly -t -config`.
+- Automatic stdlib gains on rebuild with no code change: `encoding/json` now backed by `encoding/json/v2` (same API, faster `Unmarshal`, stricter defaults available via `Options`), `compress/flate` (hence `compress/gzip`) faster, `net/http` `Response.Body` auto-drains on close for better connection reuse, and the runtime's size-specialized malloc for <80 B allocations (~30% cheaper per small alloc, ~1% global, +60 KB binary; disable with `GOEXPERIMENT=nosizespecializedmalloc`).
+
+### Features
+
+- **`max_header_value_count`** — optional global config field (`int`, `0` = default) mapped to `http.Server.MaxHeaderValueCount` (`internal/server/server.go:188`, `internal/config/config.go:41`). Hardens against header-value bomb attacks. Validated as non-negative in `config.validate()`.
+- **Goroutine-leak pprof** — Go 1.27's `goroutineleak` profile is now generally available. Exposed as `GET /debug/pprof/goroutineleak` alongside `/metrics` when `metrics` is enabled (`internal/server/server.go:373`, `runtime/pprof`). No extra dependency; uses `pprof.Lookup("goroutineleak").WriteTo`.
+
+### Performance
+
+- **Leaner proxy path** — `internal/proxy/proxy.go:268` now uses `(*url.URL).Clone()` (Go 1.27) instead of field-by-field copy, cloning `User` atomically and removing the manual `SetBasicAuth` path. `BenchmarkProxy_*` show ~3–5% lower latency and ~15% fewer `B/op` on single-upstream hot path after the combined proxy fixes.
+- **Fewer syscalls on static directory listings** — parent link computation uses `strings.CutLast` (Go 1.27 stdlib) instead of `strings.LastIndex` (`internal/static/static.go:531`). Same for `internal/nginx/convert.go:594` (`parseListenPort`).
+- **Runtime allocator** — size-specialized malloc and `compress/flate` improvement are free on Go 1.27; no pool changes needed. `BenchmarkCacheHit` stays at **10 allocs/op / 2032 B/op / ~1.9 µs** (guarded, `internal/static/benchmark_test.go`), `BenchmarkProxy_*` and `BenchmarkServer_*` benefit from reduced small-alloc cost.
+
+### Refactors / Fixes
+
+- **Removed redundant loop-var capture** — `for _, route := range s.cfg.Routes { route := route }` deleted (`internal/server/server.go:318`); loop semantics are correct since Go 1.22.
+- **Fixed `defer` inside proxy retry loop** — `internal/proxy/proxy.go:313` `defer resp.Body.Close()` inside `for` replaced by explicit `resp.Body.Close()` after `io.Copy`. The previous `defer` only fired on function exit, not on retry iteration; the retry path itself was on error (no `Body`), but the explicit close removes the anti-pattern and avoids accumulating defers on long-lived proxy handlers.
+- **`gofmt` clean** — `internal/config/config.go` gofmt gap fixed; `go vet -stdversion` passes.
+
+
 ## v1.1.2 (2026-08-05)
 
 ### Performance
