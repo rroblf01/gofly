@@ -9,6 +9,7 @@ package nginx
 import (
 	"fmt"
 	"io"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -357,7 +358,7 @@ func (c *converter) parseServer(d directive, def httpDefaults) {
 	if len(locations) == 0 {
 		// A server with just `root` serves "/".
 		if srv.root != "" {
-			c.cfg.Routes = append(c.cfg.Routes, c.staticRoute("/", srv, nil))
+			c.cfg.Routes = append(c.cfg.Routes, c.staticRoute("/", srv.root, srv, nil))
 		} else {
 			c.warnf(d.line, "server block has no location and no root; no route produced")
 		}
@@ -387,6 +388,7 @@ func (c *converter) parseLocation(loc directive, srv serverCtx) {
 		proxyPass string
 		tryFiles  bool
 		root      = srv.root
+		alias     string
 		expires   string
 		gzip      = srv.gzip
 		headers   = cloneMap(srv.headers)
@@ -395,8 +397,10 @@ func (c *converter) parseLocation(loc directive, srv serverCtx) {
 		switch s.name {
 		case "proxy_pass":
 			proxyPass = arg0(s.args)
-		case "root", "alias":
+		case "root":
 			root = arg0(s.args)
+		case "alias":
+			alias = arg0(s.args)
 		case "try_files":
 			// `try_files $uri $uri/ /index.html;` is the SPA fallback idiom.
 			if len(s.args) > 0 && strings.HasSuffix(s.args[len(s.args)-1], ".html") {
@@ -428,10 +432,7 @@ func (c *converter) parseLocation(loc directive, srv serverCtx) {
 		return
 	}
 
-	route := c.staticRoute(path, srv, headers)
-	if root != "" {
-		route.StaticDir = root
-	}
+	route := c.staticRoute(path, staticDirFor(root, alias, path), srv, headers)
 	route.SPA = tryFiles
 	route.Gzip = gzip
 	if expires != "" {
@@ -470,11 +471,11 @@ func (c *converter) locationPath(loc directive) (string, bool) {
 	}
 }
 
-func (c *converter) staticRoute(path string, srv serverCtx, headers map[string]string) config.Route {
+func (c *converter) staticRoute(path, staticDir string, srv serverCtx, headers map[string]string) config.Route {
 	r := config.Route{
 		Path:          path,
 		ServerName:    srv.serverName,
-		StaticDir:     srv.root,
+		StaticDir:     staticDir,
 		GzipMinLength: srv.gzipMinLength,
 		GzipLevel:     srv.gzipLevel,
 	}
@@ -586,6 +587,21 @@ func cloneMap(m map[string]string) map[string]string {
 		out[k] = v
 	}
 	return out
+}
+
+// staticDirFor resolves the directory a static route serves from, preserving
+// nginx's root/alias distinction. gofly's static handler strips the route prefix
+// before joining the file path, which is alias semantics, so a `root` must have
+// the location path appended: nginx maps `location /sub/ { root /www; }` to
+// /www/sub/..., whereas `alias /www/` replaces the matched prefix outright.
+func staticDirFor(root, alias, path string) string {
+	if alias != "" {
+		return alias
+	}
+	if root == "" {
+		return ""
+	}
+	return filepath.Join(root, strings.TrimSuffix(path, "/"))
 }
 
 // parseListenPort extracts the port from an nginx listen argument such as

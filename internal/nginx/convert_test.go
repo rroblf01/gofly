@@ -221,6 +221,58 @@ func TestNginxTimeSeconds(t *testing.T) {
 	}
 }
 
+func TestConvertRootVsAlias(t *testing.T) {
+	src := `server {
+  listen 80;
+  location /sub/ { root /www; }
+  location /files/ { alias /var/www/files/; }
+}`
+	cfg, _, err := Convert(strings.NewReader(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Routes) != 2 {
+		t.Fatalf("routes = %d, want 2", len(cfg.Routes))
+	}
+	// nginx `root` appends the location path: /sub/ maps to /www/sub/...
+	if got := cfg.Routes[0].StaticDir; got != "/www/sub" {
+		t.Errorf("root location static_dir = %q, want /www/sub", got)
+	}
+	// `alias` replaces the matched prefix, so it is used verbatim.
+	if got := cfg.Routes[1].StaticDir; got != "/var/www/files/" {
+		t.Errorf("alias location static_dir = %q, want /var/www/files/", got)
+	}
+}
+
+func TestConvertInheritedRootAppendsLocationPath(t *testing.T) {
+	src := `server {
+  listen 80;
+  root /var/www;
+  location /assets/ { expires 1h; }
+}`
+	cfg, _, err := Convert(strings.NewReader(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Routes) != 1 {
+		t.Fatalf("routes = %d, want 1", len(cfg.Routes))
+	}
+	if got := cfg.Routes[0].StaticDir; got != "/var/www/assets" {
+		t.Errorf("inherited root static_dir = %q, want /var/www/assets", got)
+	}
+}
+
+func TestConvertServerRootOnly(t *testing.T) {
+	src := `server { listen 80; root /srv/www; }`
+	cfg, _, err := Convert(strings.NewReader(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Routes) != 1 || cfg.Routes[0].StaticDir != "/srv/www" {
+		t.Fatalf("server-root-only route = %+v", cfg.Routes)
+	}
+}
+
 func hasWarning(warns []string, substr string) bool {
 	for _, w := range warns {
 		if strings.Contains(w, substr) {
