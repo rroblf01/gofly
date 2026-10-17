@@ -248,6 +248,12 @@ func (c *converter) walkTop(dirs []directive) {
 				def.gzipMinLength = atoiDefault(d.args, 0)
 			case "gzip_comp_level":
 				def.gzipLevel = intPtr(atoiDefault(d.args, -1))
+			case "send_timeout":
+				if td, ok := nginxDuration(d.args); ok {
+					c.cfg.SendTimeout = td
+				} else {
+					c.warnf(d.line, "send_timeout %q: unrecognised time; ignored", strings.Join(d.args, " "))
+				}
 			case "gzip_types", "gzip_vary", "gzip_proxied", "gzip_disable":
 				c.warnf(d.line, "gzip tuning %q not configurable in gofly (it gzips by size); skipped", d.name)
 			case "include":
@@ -261,7 +267,7 @@ func (c *converter) walkTop(dirs []directive) {
 	}
 	for _, d := range dirs {
 		if d.name == "http" {
-			// apply http-level gzip defaults before its servers
+			// apply http-level gzip defaults and send_timeout before its servers
 			for _, h := range d.block {
 				switch h.name {
 				case "gzip":
@@ -270,6 +276,12 @@ func (c *converter) walkTop(dirs []directive) {
 					def.gzipMinLength = atoiDefault(h.args, 0)
 				case "gzip_comp_level":
 					def.gzipLevel = intPtr(atoiDefault(h.args, -1))
+				case "send_timeout":
+					if td, ok := nginxDuration(h.args); ok {
+						c.cfg.SendTimeout = td
+					} else {
+						c.warnf(h.line, "send_timeout %q: unrecognised time; ignored", strings.Join(h.args, " "))
+					}
 				}
 			}
 			process(d.block)
@@ -342,6 +354,12 @@ func (c *converter) parseServer(d directive, def httpDefaults) {
 			}
 		case "gzip":
 			srv.gzip = boolPtr(onOff(s.args))
+		case "send_timeout":
+			if td, ok := nginxDuration(s.args); ok {
+				srv.sendTimeout = td
+			} else {
+				c.warnf(s.line, "send_timeout %q: unrecognised time; ignored", strings.Join(s.args, " "))
+			}
 		case "location":
 			locations = append(locations, s)
 		case "error_page":
@@ -376,6 +394,7 @@ type serverCtx struct {
 	gzipMinLength int
 	gzipLevel     *int
 	headers       map[string]string
+	sendTimeout   *config.Duration
 }
 
 func (c *converter) parseLocation(loc directive, srv serverCtx) {
@@ -391,6 +410,7 @@ func (c *converter) parseLocation(loc directive, srv serverCtx) {
 		alias       string
 		expires     string
 		gzip        = srv.gzip
+		sendTimeout = srv.sendTimeout
 		respHeaders = cloneMap(srv.headers) // inherited server add_header
 		locHeader   bool                    // location defined its own add_header
 		reqHeaders  = map[string]string{}   // proxy_set_header
@@ -425,6 +445,12 @@ func (c *converter) parseLocation(loc directive, srv serverCtx) {
 			}
 		case "gzip":
 			gzip = boolPtr(onOff(s.args))
+		case "send_timeout":
+			if td, ok := nginxDuration(s.args); ok {
+				sendTimeout = td
+			} else {
+				c.warnf(s.line, "send_timeout %q: unrecognised time; ignored", strings.Join(s.args, " "))
+			}
 		case "proxy_set_header":
 			if len(s.args) >= 2 {
 				reqHeaders[s.args[0]] = s.args[1]
@@ -437,11 +463,14 @@ func (c *converter) parseLocation(loc directive, srv serverCtx) {
 	}
 
 	if proxyPass != "" {
-		c.cfg.Routes = append(c.cfg.Routes, c.proxyRoute(path, proxyPass, srv, reqHeaders, respHeaders, gzip))
+		pr := c.proxyRoute(path, proxyPass, srv, reqHeaders, respHeaders, gzip)
+		pr.SendTimeout = sendTimeout
+		c.cfg.Routes = append(c.cfg.Routes, pr)
 		return
 	}
 
 	route := c.staticRoute(path, staticDirFor(root, alias, path), srv, respHeaders)
+	route.SendTimeout = sendTimeout
 	route.SPA = tryFiles
 	route.Gzip = gzip
 	if expires != "" {
@@ -487,6 +516,7 @@ func (c *converter) staticRoute(path, staticDir string, srv serverCtx, respHeade
 		StaticDir:     staticDir,
 		GzipMinLength: srv.gzipMinLength,
 		GzipLevel:     srv.gzipLevel,
+		SendTimeout:   srv.sendTimeout,
 	}
 	if len(respHeaders) > 0 {
 		r.ResponseHeaders = respHeaders
@@ -496,9 +526,10 @@ func (c *converter) staticRoute(path, staticDir string, srv serverCtx, respHeade
 
 func (c *converter) proxyRoute(path, proxyPass string, srv serverCtx, reqHeaders, respHeaders map[string]string, gzip *bool) config.Route {
 	r := config.Route{
-		Path:       path,
-		ServerName: srv.serverName,
-		Gzip:       gzip,
+		Path:        path,
+		ServerName:  srv.serverName,
+		Gzip:        gzip,
+		SendTimeout: srv.sendTimeout,
 	}
 	if len(reqHeaders) > 0 {
 		r.SetHeaders = reqHeaders
@@ -565,6 +596,19 @@ func arg0(args []string) string {
 }
 
 func onOff(args []string) bool { return len(args) > 0 && args[0] == "on" }
+
+// nginxDuration parses an nginx time argument (e.g. "60s") into a config
+// Duration, reporting false for a missing or unrecognised value.
+func nginxDuration(args []string) (*config.Duration, bool) {
+	if len(args) == 0 {
+		return nil, false
+	}
+	secs, ok := nginxTimeSeconds(args[0])
+	if !ok || secs < 0 {
+		return nil, false
+	}
+	return &config.Duration{Duration: secsDur(secs)}, true
+}
 
 func atoiDefault(args []string, def int) int {
 	if len(args) == 0 {

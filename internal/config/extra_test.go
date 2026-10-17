@@ -55,6 +55,8 @@ func TestValidate_Branches(t *testing.T) {
 		{"upstream per host negative", `{"upstream":{"max_idle_conns_per_host":-1},"routes":[{"path":"/","static_dir":"/www"}]}`, true},
 		{"upstream buffer negative", `{"upstream":{"buffer_size":-1},"routes":[{"path":"/","static_dir":"/www"}]}`, true},
 		{"health_check_interval non-positive", `{"routes":[{"path":"/","static_dir":"/www","health_check_interval":"0s"}]}`, true},
+		{"send_timeout negative", `{"send_timeout":"-1s","routes":[{"path":"/","static_dir":"/www"}]}`, true},
+		{"route send_timeout negative", `{"routes":[{"path":"/","static_dir":"/www","send_timeout":"-1s"}]}`, true},
 		{"valid base", base, false},
 	}
 	for _, tc := range cases {
@@ -128,6 +130,54 @@ func TestLoad_MaxHeaderValueCount(t *testing.T) {
 	}
 	if cfg.MaxHeaderValueCount != 10 {
 		t.Errorf("max_header %d want 10", cfg.MaxHeaderValueCount)
+	}
+}
+
+func TestLoad_SendTimeout(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "cfg.json")
+	js := `{"send_timeout":"20s","routes":[{"path":"/","static_dir":"/www","send_timeout":"7s"}]}`
+	os.WriteFile(path, []byte(js), 0644)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.SendTimeoutDefault() != 20*time.Second {
+		t.Errorf("global send_timeout = %v, want 20s", cfg.SendTimeoutDefault())
+	}
+	if cfg.Routes[0].SendTimeout == nil || cfg.Routes[0].SendTimeout.Duration != 7*time.Second {
+		t.Errorf("route send_timeout = %v, want 7s", cfg.Routes[0].SendTimeout)
+	}
+}
+
+func TestSendTimeoutDefaultUnset(t *testing.T) {
+	c := Config{}
+	if got := c.SendTimeoutDefault(); got != DefaultSendTimeout {
+		t.Errorf("default send timeout = %v, want %v", got, DefaultSendTimeout)
+	}
+}
+
+func TestStaticWriteLimitOnlyWhenExplicit(t *testing.T) {
+	dir := t.TempDir()
+
+	defaultPath := filepath.Join(dir, "default.json")
+	os.WriteFile(defaultPath, []byte(`{"routes":[{"path":"/","static_dir":"/www"}]}`), 0644)
+	c1, err := Load(defaultPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := c1.StaticWriteLimit(); got != 0 {
+		t.Errorf("default StaticWriteLimit = %v, want 0 (no total cap)", got)
+	}
+
+	explicitPath := filepath.Join(dir, "explicit.json")
+	os.WriteFile(explicitPath, []byte(`{"write_timeout":"45s","routes":[{"path":"/","static_dir":"/www"}]}`), 0644)
+	c2, err := Load(explicitPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := c2.StaticWriteLimit(); got != 45*time.Second {
+		t.Errorf("explicit StaticWriteLimit = %v, want 45s", got)
 	}
 }
 

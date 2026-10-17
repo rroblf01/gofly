@@ -1,17 +1,184 @@
 package static
 
 import (
+	"bytes"
 	"io"
 	"mime"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/rroblf01/gofly/internal/config"
 )
+
+// deadlineRecorder is a ResponseWriter that records the readers handed to
+// ReadFrom and the deadlines passed to SetWriteDeadline, so a test can assert
+// both the chunking and the sendfile precondition (an *io.LimitedReader around
+// an *os.File, which Go's net/sendfile unwraps).
+type deadlineRecorder struct {
+	header    http.Header
+	written   int64
+	readers   []io.Reader
+	deadlines []time.Time
+}
+
+func (d *deadlineRecorder) Header() http.Header {
+	if d.header == nil {
+		d.header = http.Header{}
+	}
+	return d.header
+}
+func (d *deadlineRecorder) Write(b []byte) (int, error) {
+	d.written += int64(len(b))
+	return len(b), nil
+}
+func (d *deadlineRecorder) WriteHeader(int) {}
+func (d *deadlineRecorder) SetWriteDeadline(t time.Time) error {
+	d.deadlines = append(d.deadlines, t)
+	return nil
+}
+func (d *deadlineRecorder) ReadFrom(r io.Reader) (int64, error) {
+	d.readers = append(d.readers, r)
+	n, err := io.Copy(io.Discard, r)
+	d.written += n
+	return n, err
+}
+
+// slowWriter simulates a slow but progressing client: each chunk takes delay and
+// the write fails if the current deadline has already passed.
+type slowWriter struct {
+	deadlineRecorder
+	delay    time.Duration
+	deadline time.Time
+}
+
+func (s *slowWriter) SetWriteDeadline(t time.Time) error { s.deadline = t; return nil }
+func (s *slowWriter) ReadFrom(r io.Reader) (int64, error) {
+	time.Sleep(s.delay)
+	if !s.deadline.IsZero() && time.Now().After(s.deadline) {
+		return 0, os.ErrDeadlineExceeded
+	}
+	return s.deadlineRecorder.ReadFrom(r)
+}
+
+func writeTempFile(t *testing.T, name string, size int) (string, []byte) {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, name)
+	data := bytes.Repeat([]byte("x"), size)
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		t.Fatal(err)
+	}
+	return path, data
+}
+
+func TestWriteBodyChunksPreserveSendfileSource(t *testing.T) {
+	path, data := writeTempFile(t, "big.bin", 3*writeChunkSize+123)
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	h := New(config.Route{Path: "/", StaticDir: filepath.Dir(path)})
+	h.SetTimeouts(time.Minute, 0)
+
+	rec := &deadlineRecorder{}
+	h.writeBody(rec, f)
+
+	if rec.written != int64(len(data)) {
+		t.Fatalf("wrote %d bytes, want %d", rec.written, len(data))
+	}
+	if len(rec.readers) < 4 {
+		t.Fatalf("copy was not chunked: %d ReadFrom calls for a %d-byte file", len(rec.readers), len(data))
+	}
+	for i, r := range rec.readers {
+		lr, ok := r.(*io.LimitedReader)
+		if !ok {
+			t.Fatalf("chunk %d reader is %T, want *io.LimitedReader", i, r)
+		}
+		if _, ok := lr.R.(*os.File); !ok {
+			t.Fatalf("chunk %d source is %T, want *os.File (sendfile precondition)", i, lr.R)
+		}
+	}
+	if len(rec.deadlines) < len(rec.readers) {
+		t.Errorf("deadlines reset %d times for %d chunks, want at least one per chunk", len(rec.deadlines), len(rec.readers))
+	}
+}
+
+func TestSlowDownloadCompletesWithSendTimeout(t *testing.T) {
+	// A single absolute deadline would abort this transfer partway; renewing it
+	// per chunk (each well under send_timeout) lets it finish. This is the
+	// scaled equivalent of a 40 MB file read at 500 KB/s outliving a 30s
+	// write_timeout.
+	const chunks = 12
+	path, data := writeTempFile(t, "big.bin", chunks*writeChunkSize)
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	h := New(config.Route{Path: "/", StaticDir: filepath.Dir(path)})
+	h.SetTimeouts(500*time.Millisecond, 0)
+
+	w := &slowWriter{delay: 100 * time.Millisecond}
+	h.writeBody(w, f)
+
+	if w.written != int64(len(data)) {
+		t.Fatalf("wrote %d of %d bytes: slow download was cut short", w.written, len(data))
+	}
+}
+
+func TestWriteLimitCapsTotalTime(t *testing.T) {
+	const chunks = 12
+	path, data := writeTempFile(t, "big.bin", chunks*writeChunkSize)
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	h := New(config.Route{Path: "/", StaticDir: filepath.Dir(path)})
+	// Total cap far below the ~1.2s the transfer would take.
+	h.SetTimeouts(time.Second, 250*time.Millisecond)
+
+	w := &slowWriter{delay: 100 * time.Millisecond}
+	h.writeBody(w, f)
+
+	if w.written == int64(len(data)) {
+		t.Errorf("total write limit did not cap the transfer: wrote all %d bytes", len(data))
+	}
+}
+
+func TestChunkDeadline(t *testing.T) {
+	start := time.Now()
+
+	h := &Handler{}
+	h.SetTimeouts(time.Minute, 0)
+	if d := h.chunkDeadline(start); d.Before(time.Now().Add(50 * time.Second)) {
+		t.Errorf("send-only deadline = %v, want ~now+1m", d)
+	}
+
+	h.SetTimeouts(time.Minute, 10*time.Second)
+	if d := h.chunkDeadline(start); d.After(start.Add(10*time.Second + time.Millisecond)) {
+		t.Errorf("total limit not applied: deadline = %v, want <= start+10s", d)
+	}
+
+	h.SetTimeouts(0, 10*time.Second)
+	if d := h.chunkDeadline(start); !d.Equal(start.Add(10 * time.Second)) {
+		t.Errorf("send disabled deadline = %v, want start+10s", d)
+	}
+
+	h.SetTimeouts(0, 0)
+	if d := h.chunkDeadline(start); !d.IsZero() {
+		t.Errorf("both disabled deadline = %v, want zero", d)
+	}
+}
 
 func TestPrecompressedUnknownExtensionMIME(t *testing.T) {
 	dir := t.TempDir()

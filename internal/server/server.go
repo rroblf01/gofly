@@ -320,7 +320,13 @@ func (s *Server) registerRoutes() {
 		var h http.Handler
 		switch {
 		case route.StaticDir != "":
-			h = static.New(route)
+			sh := static.New(route)
+			send := s.cfg.SendTimeoutDefault()
+			if route.SendTimeout != nil && route.SendTimeout.Duration > 0 {
+				send = route.SendTimeout.Duration
+			}
+			sh.SetTimeouts(send, s.cfg.StaticWriteLimit())
+			h = sh
 			if gzipEnabled(route) {
 				h = gzipMiddlewareWith(h, route.GzipCompressionLevel(), route.GzipMinLength)
 			}
@@ -722,6 +728,12 @@ func (rw *responseWriter) SetUpstream(u string) {
 	rw.upstream = u
 }
 
+// Unwrap exposes the wrapped writer to http.ResponseController so static
+// streaming can set write deadlines through this middleware.
+func (rw *responseWriter) Unwrap() http.ResponseWriter {
+	return rw.ResponseWriter
+}
+
 func (rw *responseWriter) WriteHeader(code int) {
 	if !rw.written {
 		rw.status = code
@@ -841,6 +853,12 @@ type gzipResponseWriter struct {
 	gw          *gzip.Writer
 	gzipOn      bool
 	wroteHeader bool
+}
+
+// Unwrap exposes the wrapped writer to http.ResponseController so write
+// deadlines reach the underlying connection through the gzip layer.
+func (g *gzipResponseWriter) Unwrap() http.ResponseWriter {
+	return g.ResponseWriter
 }
 
 func (g *gzipResponseWriter) commitGzip() {

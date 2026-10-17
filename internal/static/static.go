@@ -68,6 +68,8 @@ type Handler struct {
 	secHeaders     bool
 	precompressed  bool
 	cache          *fileCache
+	sendTimeout    time.Duration
+	writeLimit     time.Duration
 }
 
 func New(route config.Route) *Handler {
@@ -86,6 +88,7 @@ func New(route config.Route) *Handler {
 		errorPages:    route.ErrorPages,
 		secHeaders:    route.SecurityHeadersDefault(),
 		precompressed: route.PrecompressedEnabled(),
+		sendTimeout:   config.DefaultSendTimeout,
 	}
 	if route.BrowserCacheTTL != nil {
 		h.cacheTTL = "public, max-age=" + strconv.FormatInt(int64(route.BrowserCacheTTL.Seconds()), 10)
@@ -107,6 +110,15 @@ func New(route config.Route) *Handler {
 		h.cache = newFileCache(route.StaticCacheTTL.Duration, route.EffectiveStaticCacheMaxBytes())
 	}
 	return h
+}
+
+// SetTimeouts configures deadline management for streamed static responses.
+// send is the maximum gap without progress between two writes; limit, when
+// > 0, caps the total time the body may take. A zero send disables per-write
+// renewal, leaving limit as the only (absolute) deadline.
+func (h *Handler) SetTimeouts(send, limit time.Duration) {
+	h.sendTimeout = send
+	h.writeLimit = limit
 }
 
 // applyResponseHeaders copies the configured response headers into hdr:
@@ -373,7 +385,7 @@ func (h *Handler) serveContent(w http.ResponseWriter, r *http.Request, src io.Re
 	h.applyResponseHeaders(hdr)
 
 	w.WriteHeader(http.StatusOK)
-	writeBody(w, src)
+	h.writeBody(w, src)
 }
 
 // serveCached is the in-memory cache hot path. Everything it emits is either a
@@ -443,18 +455,72 @@ func (h *Handler) writeNotModified(w http.ResponseWriter, etag, lastMod string) 
 	w.WriteHeader(http.StatusNotModified)
 }
 
-func writeBody(w http.ResponseWriter, src io.ReadSeeker) {
-	if f, ok := src.(*os.File); ok {
-		if rf, ok := w.(io.ReaderFrom); ok {
-			rf.ReadFrom(f)
-			return
-		}
+// writeChunkSize is the piece size for streamed static files. Chunking lets the
+// handler renew the write deadline between pieces; 1 MiB keeps the per-chunk
+// bookkeeping negligible while still making progress on a slow link.
+const writeChunkSize = 1 << 20
+
+// writeBody copies src to w. A regular file is streamed in writeChunkSize
+// pieces so the write deadline can be renewed before each piece (see
+// streamFile); everything else is copied in one pass.
+func (h *Handler) writeBody(w http.ResponseWriter, src io.ReadSeeker) {
+	if f, ok := src.(*os.File); ok && h.streamFile(w, f) {
+		return
 	}
 	if wt, ok := src.(io.WriterTo); ok {
 		wt.WriteTo(w)
 		return
 	}
 	io.Copy(w, src)
+}
+
+// streamFile copies f to w in chunks, renewing the connection's write deadline
+// before each chunk so send_timeout (max time without progress) applies instead
+// of the server's absolute WriteTimeout. Chunking through io.CopyN keeps
+// sendfile(2) available: Go's net/sendfile unwraps the *io.LimitedReader that
+// io.CopyN wraps around an *os.File, and the ResponseWriter's ReadFrom is
+// reached through the wrapper chain.
+//
+// It returns false without writing anything when deadline control is
+// unavailable (e.g. an httptest.ResponseRecorder), letting the caller fall back
+// to a single copy. Otherwise it returns true once the source is exhausted or
+// the transfer stops (client gone, deadline fired).
+func (h *Handler) streamFile(w http.ResponseWriter, f *os.File) bool {
+	if h.sendTimeout <= 0 && h.writeLimit <= 0 {
+		return false
+	}
+	rc := http.NewResponseController(w)
+	start := time.Now()
+	if err := rc.SetWriteDeadline(h.chunkDeadline(start)); err != nil {
+		return false
+	}
+	for {
+		if _, err := io.CopyN(w, f, writeChunkSize); err != nil {
+			// io.EOF is a clean end; any other error also ends the transfer.
+			return true
+		}
+		if err := rc.SetWriteDeadline(h.chunkDeadline(start)); err != nil {
+			return true
+		}
+	}
+}
+
+// chunkDeadline returns the deadline for the next write: now+sendTimeout, capped
+// at start+writeLimit when a total limit is configured. A zero result clears the
+// deadline.
+func (h *Handler) chunkDeadline(start time.Time) time.Time {
+	var limit time.Time
+	if h.writeLimit > 0 {
+		limit = start.Add(h.writeLimit)
+	}
+	if h.sendTimeout <= 0 {
+		return limit
+	}
+	d := time.Now().Add(h.sendTimeout)
+	if !limit.IsZero() && limit.Before(d) {
+		return limit
+	}
+	return d
 }
 
 func (h *Handler) serveRange(w http.ResponseWriter, r *http.Request, src io.ReadSeeker, size int64, ctype, etag, lastMod string) bool {

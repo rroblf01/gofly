@@ -3,6 +3,7 @@ package nginx
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestConvertStaticSPA(t *testing.T) {
@@ -311,6 +312,34 @@ func TestConvertInheritedRootAppendsLocationPath(t *testing.T) {
 	}
 	if got := cfg.Routes[0].StaticDir; got != "/var/www/assets" {
 		t.Errorf("inherited root static_dir = %q, want /var/www/assets", got)
+	}
+}
+
+func TestConvertSendTimeout(t *testing.T) {
+	src := `http {
+  send_timeout 15s;
+  server {
+    listen 80;
+    send_timeout 30s;
+    location /a/ { root /www; }
+    location /b/ { root /www; send_timeout 5s; }
+  }
+}`
+	cfg, _, err := Convert(strings.NewReader(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.SendTimeout == nil || cfg.SendTimeout.Duration != 15*time.Second {
+		t.Errorf("http send_timeout = %v, want 15s", cfg.SendTimeout)
+	}
+	if len(cfg.Routes) != 2 {
+		t.Fatalf("routes = %d, want 2", len(cfg.Routes))
+	}
+	if r := cfg.Routes[0].SendTimeout; r == nil || r.Duration != 30*time.Second {
+		t.Errorf("server-level send_timeout = %v, want 30s", r)
+	}
+	if r := cfg.Routes[1].SendTimeout; r == nil || r.Duration != 5*time.Second {
+		t.Errorf("location send_timeout = %v, want 5s", r)
 	}
 }
 

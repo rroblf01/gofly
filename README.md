@@ -181,7 +181,8 @@ gofly uses a single JSON config file. Default path: `/etc/gofly/config.json` (ov
 | `workers` | int | `1` | Number of SO_REUSEPORT accept goroutines (Linux only) |
 | `access_log` | bool | `true` | Enable/disable access log (disable for maximum throughput) |
 | `read_timeout` | string | `"30s"` | Max duration for reading request |
-| `write_timeout` | string | `"30s"` | Max duration for writing response |
+| `write_timeout` | string | `"30s"` | Max duration for writing response. For static downloads the body is governed by `send_timeout` instead; `write_timeout` caps the total body time only when set explicitly here |
+| `send_timeout` | string | `"60s"` | Max time without progress between two response writes before the transfer is aborted (nginx `send_timeout`) |
 | `idle_timeout` | string | `"120s"` | Max duration for idle connections |
 | `max_body_size` | int | `0` (unlimited) | Max request body size in bytes |
 | `memory_limit` | int | `104857600` (100 MB) | Soft heap limit in bytes (`debug.SetMemoryLimit`) |
@@ -208,6 +209,7 @@ gofly uses a single JSON config file. Default path: `/etc/gofly/config.json` (ov
 | `static_cache_ttl` | string | — | Cache small files (≤1 MiB) in memory for this TTL, skipping open/stat/read syscalls. Takes precedence over `precompressed`. |
 | `precompressed` | bool | `true` | Probe for a sibling `.gz` file when the client accepts gzip. Set `false` to skip the stat syscall on routes without pre-compressed assets. |
 | `browser_cache_ttl` | string | — | Cache-Control max-age (e.g. `"3600s"`) |
+| `send_timeout` | string | global | Per-route override of the max time without progress between two response writes |
 | `gzip` | bool | `false` | Enable gzip compression |
 | `gzip_level` | int | `-1` (default) | gzip compression level `[-2,9]` (`1`=fastest, `9`=best, `-1`=default) |
 | `gzip_min_length` | int | `0` | Minimum response size in bytes before compressing (0 = always) |
@@ -268,8 +270,8 @@ gofly -t -config config.json                         # then validate the result
 **Translated:** `listen` (port + `ssl`), `server_name`, `root`, `location`
 (prefix, `=`, `^~`), `try_files …/index.html` → `spa`, `proxy_pass` +
 `upstream` blocks (incl. `least_conn`), `add_header` → `response_headers`,
-`proxy_set_header` → `set_headers`, `expires` → `browser_cache_ttl`, `gzip`/`gzip_min_length`/
-`gzip_comp_level`, and `ssl_certificate`/`ssl_certificate_key` → `tls`.
+`proxy_set_header` → `set_headers`, `expires` → `browser_cache_ttl`, `send_timeout`,
+`gzip`/`gzip_min_length`/`gzip_comp_level`, and `ssl_certificate`/`ssl_certificate_key` → `tls`.
 
 **Not translated (warned, not silently dropped):** regex `location ~`/`~*`
 (gofly is prefix-only), `rewrite`/`return`, `if`, `map`, `limit_req`, `gzip_types`

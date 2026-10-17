@@ -9,6 +9,10 @@ import (
 
 const DefaultMemoryLimit int64 = 100 << 20 // 100 MB
 
+// DefaultSendTimeout is the nginx-compatible default for the maximum time
+// without progress between two response writes before the transfer is aborted.
+const DefaultSendTimeout = 60 * time.Second
+
 // Memory-conservative defaults for the shared upstream transport. Tuned for a
 // small (~100 MB) memory budget rather than maximum throughput; raise via the
 // `upstream` config block on high-traffic deployments.
@@ -27,6 +31,7 @@ type Config struct {
 	Workers             int        `json:"workers,omitempty"`
 	ReadTimeout         Duration   `json:"read_timeout,omitempty"`
 	WriteTimeout        Duration   `json:"write_timeout,omitempty"`
+	SendTimeout         *Duration  `json:"send_timeout,omitempty"`
 	IdleTimeout         Duration   `json:"idle_timeout,omitempty"`
 	MaxBodySize         int64      `json:"max_body_size,omitempty"`
 	RateLimit           *RateLimit `json:"rate_limit,omitempty"`
@@ -40,6 +45,13 @@ type Config struct {
 	Upstream            *Upstream  `json:"upstream,omitempty"`
 	MaxHeaderValueCount int        `json:"max_header_value_count,omitempty"`
 	Routes              []Route    `json:"routes"`
+
+	// writeTimeoutExplicit records whether write_timeout was present in the
+	// config file. A static response whose body is still making progress is
+	// governed by send_timeout; the total write_timeout cap is applied only
+	// when the operator set it deliberately, so the built-in default does not
+	// abort a slow but healthy download.
+	writeTimeoutExplicit bool
 }
 
 // Upstream tunes the shared HTTP transport used for every proxy route. Smaller
@@ -81,6 +93,7 @@ type Route struct {
 	RemoveHeaders       []string          `json:"remove_headers,omitempty"`
 	StaticDir           string            `json:"static_dir,omitempty"`
 	BrowserCacheTTL     *Duration         `json:"browser_cache_ttl,omitempty"`
+	SendTimeout         *Duration         `json:"send_timeout,omitempty"`
 	Rewrite             string            `json:"rewrite,omitempty"`
 	UpstreamTimeout     *Duration         `json:"upstream_timeout,omitempty"`
 	RetryOnError        bool              `json:"retry_on_error,omitempty"`
@@ -142,6 +155,8 @@ func Load(path string) (Config, error) {
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return cfg, fmt.Errorf("parse config: %w", err)
 	}
+
+	cfg.writeTimeoutExplicit = jsonHasKey(data, "write_timeout")
 
 	cfg.expandEnv()
 
@@ -238,6 +253,13 @@ func (c *Config) validate() error {
 		if r.StaticCacheMaxBytes < 0 {
 			return fmt.Errorf("routes[%d].static_cache_max_bytes must be non-negative", i)
 		}
+		if r.SendTimeout != nil && r.SendTimeout.Duration < 0 {
+			return fmt.Errorf("routes[%d].send_timeout must be non-negative", i)
+		}
+	}
+
+	if c.SendTimeout != nil && c.SendTimeout.Duration < 0 {
+		return fmt.Errorf("send_timeout must be non-negative")
 	}
 
 	if c.MaxProcs < 0 {
@@ -289,6 +311,37 @@ func (c *Config) EffectiveMemoryLimit() int64 {
 		return c.MemoryLimit
 	}
 	return DefaultMemoryLimit
+}
+
+// SendTimeoutDefault is the global send timeout, falling back to
+// DefaultSendTimeout when unset.
+func (c *Config) SendTimeoutDefault() time.Duration {
+	if c.SendTimeout != nil && c.SendTimeout.Duration > 0 {
+		return c.SendTimeout.Duration
+	}
+	return DefaultSendTimeout
+}
+
+// StaticWriteLimit is the total body time allowed for a static response. It is
+// 0 (no total cap) unless write_timeout was set explicitly in the config, so a
+// progressing download is not cut by the built-in default; send_timeout
+// governs stalls instead.
+func (c *Config) StaticWriteLimit() time.Duration {
+	if c.writeTimeoutExplicit {
+		return c.WriteTimeout.Duration
+	}
+	return 0
+}
+
+// jsonHasKey reports whether the top-level JSON object in data contains key. It
+// is used to distinguish an explicit write_timeout from the built-in default.
+func jsonHasKey(data []byte, key string) bool {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return false
+	}
+	_, ok := raw[key]
+	return ok
 }
 
 func (c *Config) SecurityHeadersEnabled() bool {
