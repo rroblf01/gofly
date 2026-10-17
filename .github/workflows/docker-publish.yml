@@ -49,6 +49,9 @@ jobs:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
+          # github.ref_name is the release tag (e.g. v1.3.1); the Dockerfile
+          # bakes it into `gofly -version` via -ldflags, otherwise it prints dev.
+          build-args: VERSION=${{ github.ref_name }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
