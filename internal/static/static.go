@@ -248,12 +248,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				// ".gz"). Without Content-Encoding the client receives raw gzip
 				// labelled as the identity type and renders garbage.
 				//
-				// The type is looked up by the original extension and never
-				// sniffed: the bytes are compressed, so sniffing an unknown
-				// extension would report application/x-gzip.
+				// The type comes from the original extension, or from sniffing
+				// the *uncompressed* sibling when the extension is unknown. The
+				// compressed bytes must never be sniffed (that would report
+				// application/x-gzip), and sniffing the sibling keeps the type
+				// identical to the identity response for the same resource.
 				ctype := mime.TypeByExtension(filepath.Ext(gz.orig))
 				if ctype == "" {
-					ctype = octetStreamContentType
+					ctype = sniffFileContentType(gz.orig)
 				}
 				hdr := w.Header()
 				hdr["Content-Encoding"] = gzipEncodingHeader
@@ -836,6 +838,23 @@ func (c *fileCache) put(key string, e *cacheEntry) {
 func (c *fileCache) removeLocked(key string, it cacheItem) {
 	delete(c.entries, key)
 	c.curBytes -= int64(len(it.entry.data))
+}
+
+// sniffFileContentType returns the content type of the uncompressed file at
+// path by reading up to 512 bytes, falling back to application/octet-stream if
+// it cannot be opened. It lets the pre-compressed path report the same type as
+// the identity response for an extension absent from the MIME table, without
+// ever sniffing the compressed bytes.
+func sniffFileContentType(path string) string {
+	f, err := os.Open(path)
+	if err != nil {
+		return octetStreamContentType
+	}
+	defer f.Close()
+	bufp := sniffPool.Get().(*[]byte)
+	defer sniffPool.Put(bufp)
+	n, _ := f.Read(*bufp)
+	return http.DetectContentType((*bufp)[:n])
 }
 
 func precompressedGzip(r *http.Request, target string) (*gzipFile, bool) {

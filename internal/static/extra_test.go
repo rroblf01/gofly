@@ -199,17 +199,19 @@ func TestPrecompressedUnknownExtensionMIME(t *testing.T) {
 	// Identity request: the source is sniffed, so it is text/plain.
 	resp := httptest.NewRecorder()
 	h.ServeHTTP(resp, httptest.NewRequest("GET", "/"+name, nil))
-	if ct := resp.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/plain") {
-		t.Errorf("identity Content-Type = %q, want text/plain*", ct)
+	identityType := resp.Header().Get("Content-Type")
+	if !strings.HasPrefix(identityType, "text/plain") {
+		t.Errorf("identity Content-Type = %q, want text/plain*", identityType)
 	}
 
-	// Pre-compressed request: the compressed bytes must never be sniffed.
+	// Pre-compressed request: same resource, so the same Content-Type. The
+	// compressed bytes must never be sniffed (that reported application/x-gzip).
 	resp = httptest.NewRecorder()
 	req := httptest.NewRequest("GET", "/"+name, nil)
 	req.Header.Set("Accept-Encoding", "gzip")
 	h.ServeHTTP(resp, req)
-	if ct := resp.Header().Get("Content-Type"); ct != octetStreamContentType {
-		t.Errorf("precompressed Content-Type = %q, want %q", ct, octetStreamContentType)
+	if ct := resp.Header().Get("Content-Type"); ct != identityType {
+		t.Errorf("precompressed Content-Type = %q, want %q (same as identity)", ct, identityType)
 	}
 	if ce := resp.Header().Get("Content-Encoding"); ce != "gzip" {
 		t.Errorf("Content-Encoding = %q, want gzip", ce)
