@@ -306,26 +306,14 @@ func (h *Handler) serveContent(w http.ResponseWriter, r *http.Request, src io.Re
 
 	if match := r.Header.Get("If-None-Match"); match != "" {
 		if match == etag || match == "*" {
-			hdr := w.Header()
-			hdr["Etag"] = []string{etag}
-			hdr["Last-Modified"] = []string{lastMod}
-			if h.cacheTTL != "" {
-				hdr["Cache-Control"] = h.cacheTTLHdr
-			}
-			w.WriteHeader(http.StatusNotModified)
+			h.writeNotModified(w, etag, lastMod)
 			return
 		}
 	}
 	if ims := r.Header.Get("If-Modified-Since"); ims != "" {
 		t, err := time.Parse(http.TimeFormat, ims)
 		if err == nil && !modTime.After(t) {
-			hdr := w.Header()
-			hdr["Etag"] = []string{etag}
-			hdr["Last-Modified"] = []string{lastMod}
-			if h.cacheTTL != "" {
-				hdr["Cache-Control"] = h.cacheTTLHdr
-			}
-			w.WriteHeader(http.StatusNotModified)
+			h.writeNotModified(w, etag, lastMod)
 			return
 		}
 	}
@@ -380,13 +368,13 @@ func (h *Handler) serveContent(w http.ResponseWriter, r *http.Request, src io.Re
 func (h *Handler) serveCached(w http.ResponseWriter, r *http.Request, e *cacheEntry) {
 	if match := r.Header.Get("If-None-Match"); match != "" {
 		if match == e.etag || match == "*" {
-			h.write304(w, e.etag, e.lastMod)
+			h.writeNotModified(w, e.etag, e.lastMod)
 			return
 		}
 	}
 	if ims := r.Header.Get("If-Modified-Since"); ims != "" {
 		if t, err := time.Parse(http.TimeFormat, ims); err == nil && !e.modTime.After(t) {
-			h.write304(w, e.etag, e.lastMod)
+			h.writeNotModified(w, e.etag, e.lastMod)
 			return
 		}
 	}
@@ -419,12 +407,25 @@ func (h *Handler) serveCached(w http.ResponseWriter, r *http.Request, e *cacheEn
 	w.Write(e.data)
 }
 
-func (h *Handler) write304(w http.ResponseWriter, etag, lastMod string) {
+// writeNotModified emits a 304 carrying the same validators plus the cache and
+// security headers a 200 would carry. RFC 9110 requires a 304 to repeat the
+// cache-related fields, and skipping set_headers meant a changed cache policy
+// (e.g. Cache-Control via set_headers) did not reach clients until their next
+// 200.
+func (h *Handler) writeNotModified(w http.ResponseWriter, etag, lastMod string) {
 	hdr := w.Header()
 	hdr["Etag"] = []string{etag}
 	hdr["Last-Modified"] = []string{lastMod}
 	if h.cacheTTL != "" {
 		hdr["Cache-Control"] = h.cacheTTLHdr
+	}
+	if h.secHeaders {
+		hdr["X-Content-Type-Options"] = nosniffHeader
+		hdr["X-Frame-Options"] = denyFrameHeader
+		hdr["Referrer-Policy"] = referrerHeader
+	}
+	for k, v := range h.setHeadersHdr {
+		hdr[k] = v
 	}
 	w.WriteHeader(http.StatusNotModified)
 }

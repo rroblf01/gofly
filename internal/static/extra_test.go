@@ -8,6 +8,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/rroblf01/gofly/internal/config"
 )
@@ -49,6 +50,59 @@ func TestPrecompressedUnknownExtensionMIME(t *testing.T) {
 	body, _ := io.ReadAll(resp.Body)
 	if string(body) != "gzipbytes" {
 		t.Errorf("body = %q, want gzipbytes", body)
+	}
+}
+
+func TestNotModifiedIncludesSetHeaders(t *testing.T) {
+	cacheTTL := config.Duration{Duration: time.Minute}
+	for _, cached := range []bool{false, true} {
+		dir := t.TempDir()
+		if err := os.WriteFile(dir+"/app.js", []byte("console.log(1)"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		ttl := config.Duration{Duration: time.Hour}
+		route := config.Route{
+			Path:            "/",
+			StaticDir:       dir,
+			BrowserCacheTTL: &ttl,
+			SetHeaders: map[string]string{
+				"Cache-Control": "no-cache",
+				"X-Custom":      "custom-value",
+			},
+		}
+		if cached {
+			route.StaticCacheTTL = &cacheTTL
+		}
+		h := New(route)
+
+		// First GET establishes the validator and, when enabled, the cache entry.
+		resp := httptest.NewRecorder()
+		h.ServeHTTP(resp, httptest.NewRequest("GET", "/app.js", nil))
+		if resp.Code != http.StatusOK {
+			t.Fatalf("cached=%v: status = %d, want 200", cached, resp.Code)
+		}
+		etag := resp.Header().Get("Etag")
+		if etag == "" {
+			t.Fatalf("cached=%v: missing Etag", cached)
+		}
+
+		resp = httptest.NewRecorder()
+		req := httptest.NewRequest("GET", "/app.js", nil)
+		req.Header.Set("If-None-Match", etag)
+		h.ServeHTTP(resp, req)
+
+		if resp.Code != http.StatusNotModified {
+			t.Fatalf("cached=%v: status = %d, want 304", cached, resp.Code)
+		}
+		if cc := resp.Header().Get("Cache-Control"); cc != "no-cache" {
+			t.Errorf("cached=%v: 304 Cache-Control = %q, want no-cache", cached, cc)
+		}
+		if x := resp.Header().Get("X-Custom"); x != "custom-value" {
+			t.Errorf("cached=%v: 304 X-Custom = %q, want custom-value", cached, x)
+		}
+		if x := resp.Header().Get("X-Content-Type-Options"); x != "nosniff" {
+			t.Errorf("cached=%v: 304 missing security header, got %q", cached, x)
+		}
 	}
 }
 
