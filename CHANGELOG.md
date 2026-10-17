@@ -1,5 +1,43 @@
 # Changelog
 
+## Unreleased
+
+Backwards-compatible within `1.x`: all new config fields are optional and default
+to the previous behaviour (except the static-download fix below, which is the
+intended correction).
+
+### Features
+
+- **`response_headers`** — optional route field that adds headers to the client
+  response on proxy and static routes (the nginx `add_header` equivalent).
+  Previously the converter merged `add_header` into `set_headers`, which on
+  proxy routes sent those headers to the upstream instead of the client, so a
+  migrated app's security headers silently disappeared.
+- **`send_timeout`** — global and per-route (default `60s`, nginx semantics: max
+  time without progress between two response writes). The converter now
+  translates nginx `send_timeout` and `gzip_static`.
+- The access log now includes the response body byte count.
+
+### Fixes
+
+- **Conversor: `root` vs `alias`** — a `root` inside a `location` now appends the
+  location path (`location /sub/ { root /www; }` → `static_dir /www/sub`)
+  instead of being treated as `alias`, which served the wrong files (and
+  returned 200 where nginx returns 404).
+- **Slow static downloads no longer cut by `write_timeout`** — regular files are
+  streamed in 1 MiB pieces with the write deadline renewed before each piece, so
+  `send_timeout` governs stalls. `write_timeout` caps the total body time only
+  when set explicitly; the built-in default no longer aborts a download that is
+  still making progress. Chunking preserves `sendfile(2)`.
+- **Pre-compressed MIME type** — an unknown extension served from a `.gz` sibling
+  no longer sniffs the compressed bytes (previously reported
+  `application/x-gzip`); it falls back to `application/octet-stream`. Common web
+  types missing from Go's built-in table (`.webmanifest`, `.woff`, `.woff2`,
+  `.ttf`, `.otf`, `.map`) are registered for the scratch image.
+- **304 responses now repeat `set_headers`/`response_headers` and the security
+  headers**, as RFC 9110 requires, so a cache-policy change reaches clients
+  without waiting for the next 200.
+
 ## v1.2.0 (2026-08-31)
 
 Backwards-compatible within `1.x`: all new config fields are optional and default
