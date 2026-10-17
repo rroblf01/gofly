@@ -67,12 +67,17 @@ type TLSConfig struct {
 }
 
 type Route struct {
-	Path                string            `json:"path"`
-	Host                string            `json:"host,omitempty"`
-	ServerName          string            `json:"server_name,omitempty"`
-	Upstreams           []string          `json:"upstreams,omitempty"`
-	Strategy            string            `json:"strategy,omitempty"`
+	Path       string   `json:"path"`
+	Host       string   `json:"host,omitempty"`
+	ServerName string   `json:"server_name,omitempty"`
+	Upstreams  []string `json:"upstreams,omitempty"`
+	Strategy   string   `json:"strategy,omitempty"`
+	// SetHeaders adds headers to the upstream request on proxy routes (and is
+	// harmless on static routes). ResponseHeaders adds headers to the response
+	// sent to the client, for both proxy and static routes — the equivalent of
+	// nginx add_header.
 	SetHeaders          map[string]string `json:"set_headers,omitempty"`
+	ResponseHeaders     map[string]string `json:"response_headers,omitempty"`
 	RemoveHeaders       []string          `json:"remove_headers,omitempty"`
 	StaticDir           string            `json:"static_dir,omitempty"`
 	BrowserCacheTTL     *Duration         `json:"browser_cache_ttl,omitempty"`
@@ -160,6 +165,13 @@ func (c *Config) expandEnv() {
 				expanded[os.Expand(k, os.Getenv)] = os.Expand(v, os.Getenv)
 			}
 			c.Routes[i].SetHeaders = expanded
+		}
+		if c.Routes[i].ResponseHeaders != nil {
+			expanded := make(map[string]string, len(c.Routes[i].ResponseHeaders))
+			for k, v := range c.Routes[i].ResponseHeaders {
+				expanded[os.Expand(k, os.Getenv)] = os.Expand(v, os.Getenv)
+			}
+			c.Routes[i].ResponseHeaders = expanded
 		}
 		if c.Routes[i].ErrorPages != nil {
 			expanded := make(map[int]string, len(c.Routes[i].ErrorPages))

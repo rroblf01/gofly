@@ -194,8 +194,60 @@ server {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Routes[0].SetHeaders["X-Frame-Options"] != "SAMEORIGIN" {
-		t.Errorf("quoted header not parsed: %v", cfg.Routes[0].SetHeaders)
+	if cfg.Routes[0].ResponseHeaders["X-Frame-Options"] != "SAMEORIGIN" {
+		t.Errorf("quoted header not parsed: %v", cfg.Routes[0].ResponseHeaders)
+	}
+}
+
+func TestConvertAddHeaderGoesToResponseHeaders(t *testing.T) {
+	src := `server {
+  listen 80;
+  location /api/ {
+    proxy_pass http://localhost:3000;
+    proxy_set_header X-Real-IP $remote_addr;
+    add_header X-Frame-Options DENY;
+  }
+}`
+	cfg, _, err := Convert(strings.NewReader(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := cfg.Routes[0]
+	if r.SetHeaders["X-Real-IP"] != "$remote_addr" {
+		t.Errorf("proxy_set_header should map to request set_headers: %v", r.SetHeaders)
+	}
+	if _, ok := r.SetHeaders["X-Frame-Options"]; ok {
+		t.Errorf("add_header leaked into request set_headers: %v", r.SetHeaders)
+	}
+	if r.ResponseHeaders["X-Frame-Options"] != "DENY" {
+		t.Errorf("add_header should map to response_headers: %v", r.ResponseHeaders)
+	}
+}
+
+func TestConvertLocationAddHeaderDropsInherited(t *testing.T) {
+	src := `server {
+  listen 80;
+  add_header X-Server one;
+  location /a/ { root /www; add_header X-Location two; }
+  location /b/ { root /www; }
+}`
+	cfg, _, err := Convert(strings.NewReader(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Routes) != 2 {
+		t.Fatalf("routes = %d, want 2", len(cfg.Routes))
+	}
+	// nginx: a location add_header suppresses the server-level ones entirely.
+	if _, ok := cfg.Routes[0].ResponseHeaders["X-Server"]; ok {
+		t.Errorf("location add_header should drop inherited X-Server: %v", cfg.Routes[0].ResponseHeaders)
+	}
+	if cfg.Routes[0].ResponseHeaders["X-Location"] != "two" {
+		t.Errorf("location add_header missing: %v", cfg.Routes[0].ResponseHeaders)
+	}
+	// A location without add_header still inherits the server ones.
+	if cfg.Routes[1].ResponseHeaders["X-Server"] != "one" {
+		t.Errorf("inherited server add_header missing: %v", cfg.Routes[1].ResponseHeaders)
 	}
 }
 

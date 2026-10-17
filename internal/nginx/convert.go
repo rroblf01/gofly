@@ -358,7 +358,7 @@ func (c *converter) parseServer(d directive, def httpDefaults) {
 	if len(locations) == 0 {
 		// A server with just `root` serves "/".
 		if srv.root != "" {
-			c.cfg.Routes = append(c.cfg.Routes, c.staticRoute("/", srv.root, srv, nil))
+			c.cfg.Routes = append(c.cfg.Routes, c.staticRoute("/", srv.root, srv, srv.headers))
 		} else {
 			c.warnf(d.line, "server block has no location and no root; no route produced")
 		}
@@ -385,13 +385,15 @@ func (c *converter) parseLocation(loc directive, srv serverCtx) {
 	}
 
 	var (
-		proxyPass string
-		tryFiles  bool
-		root      = srv.root
-		alias     string
-		expires   string
-		gzip      = srv.gzip
-		headers   = cloneMap(srv.headers)
+		proxyPass   string
+		tryFiles    bool
+		root        = srv.root
+		alias       string
+		expires     string
+		gzip        = srv.gzip
+		respHeaders = cloneMap(srv.headers) // inherited server add_header
+		locHeader   bool                    // location defined its own add_header
+		reqHeaders  = map[string]string{}   // proxy_set_header
 	)
 	for _, s := range loc.block {
 		switch s.name {
@@ -412,13 +414,20 @@ func (c *converter) parseLocation(loc directive, srv serverCtx) {
 			expires = arg0(s.args)
 		case "add_header":
 			if len(s.args) >= 2 {
-				headers[s.args[0]] = s.args[1]
+				// nginx does not inherit server-level add_header once a
+				// location defines any of its own; drop the inherited set on
+				// the first location add_header.
+				if !locHeader {
+					respHeaders = map[string]string{}
+					locHeader = true
+				}
+				respHeaders[s.args[0]] = s.args[1]
 			}
 		case "gzip":
 			gzip = boolPtr(onOff(s.args))
 		case "proxy_set_header":
 			if len(s.args) >= 2 {
-				headers[s.args[0]] = s.args[1]
+				reqHeaders[s.args[0]] = s.args[1]
 			}
 		case "access_log", "log_not_found", "proxy_http_version", "proxy_cache":
 			// no per-route equivalent worth mapping; silent.
@@ -428,11 +437,11 @@ func (c *converter) parseLocation(loc directive, srv serverCtx) {
 	}
 
 	if proxyPass != "" {
-		c.cfg.Routes = append(c.cfg.Routes, c.proxyRoute(path, proxyPass, srv, headers, gzip))
+		c.cfg.Routes = append(c.cfg.Routes, c.proxyRoute(path, proxyPass, srv, reqHeaders, respHeaders, gzip))
 		return
 	}
 
-	route := c.staticRoute(path, staticDirFor(root, alias, path), srv, headers)
+	route := c.staticRoute(path, staticDirFor(root, alias, path), srv, respHeaders)
 	route.SPA = tryFiles
 	route.Gzip = gzip
 	if expires != "" {
@@ -471,7 +480,7 @@ func (c *converter) locationPath(loc directive) (string, bool) {
 	}
 }
 
-func (c *converter) staticRoute(path, staticDir string, srv serverCtx, headers map[string]string) config.Route {
+func (c *converter) staticRoute(path, staticDir string, srv serverCtx, respHeaders map[string]string) config.Route {
 	r := config.Route{
 		Path:          path,
 		ServerName:    srv.serverName,
@@ -479,22 +488,23 @@ func (c *converter) staticRoute(path, staticDir string, srv serverCtx, headers m
 		GzipMinLength: srv.gzipMinLength,
 		GzipLevel:     srv.gzipLevel,
 	}
-	if len(headers) > 0 {
-		r.SetHeaders = headers
-	} else if len(srv.headers) > 0 {
-		r.SetHeaders = cloneMap(srv.headers)
+	if len(respHeaders) > 0 {
+		r.ResponseHeaders = respHeaders
 	}
 	return r
 }
 
-func (c *converter) proxyRoute(path, proxyPass string, srv serverCtx, headers map[string]string, gzip *bool) config.Route {
+func (c *converter) proxyRoute(path, proxyPass string, srv serverCtx, reqHeaders, respHeaders map[string]string, gzip *bool) config.Route {
 	r := config.Route{
 		Path:       path,
 		ServerName: srv.serverName,
 		Gzip:       gzip,
 	}
-	if len(headers) > 0 {
-		r.SetHeaders = headers
+	if len(reqHeaders) > 0 {
+		r.SetHeaders = reqHeaders
+	}
+	if len(respHeaders) > 0 {
+		r.ResponseHeaders = respHeaders
 	}
 	// proxy_pass http://name  -> resolve named upstream; else single backend.
 	target := strings.TrimPrefix(strings.TrimPrefix(proxyPass, "http://"), "https://")

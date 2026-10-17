@@ -174,6 +174,51 @@ func TestProxy_ForwardsHeaders(t *testing.T) {
 	}
 }
 
+func TestProxy_ResponseHeaders(t *testing.T) {
+	var gotRequestHeader string
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotRequestHeader = r.Header.Get("X-Response")
+		w.Header().Set("X-Override", "from-backend")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend.Close()
+
+	route := config.Route{
+		Path:      "/",
+		Upstreams: []string{backend.URL},
+		ResponseHeaders: map[string]string{
+			"X-Response": "added",
+			"X-Override": "from-route",
+		},
+	}
+
+	p, err := New(route)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frontend := httptest.NewServer(p)
+	defer frontend.Close()
+
+	resp, err := http.Get(frontend.URL + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	// Response headers reach the client...
+	if got := resp.Header.Get("X-Response"); got != "added" {
+		t.Errorf("X-Response = %q, want added", got)
+	}
+	// ...and win over a value set by the upstream.
+	if got := resp.Header.Get("X-Override"); got != "from-route" {
+		t.Errorf("X-Override = %q, want from-route", got)
+	}
+	// ...but must not be sent to the backend as request headers.
+	if gotRequestHeader != "" {
+		t.Errorf("backend received response header as request header: %q", gotRequestHeader)
+	}
+}
+
 func TestProxy_RemovesHeaders(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("X-Remove-Me") != "" {

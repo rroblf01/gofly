@@ -55,18 +55,19 @@ func init() {
 }
 
 type Handler struct {
-	root          string
-	prefix        string
-	cacheTTL      string
-	cacheTTLHdr   []string
-	setHeaders    map[string]string
-	setHeadersHdr map[string][]string
-	spa           bool
-	autoindex     bool
-	errorPages    map[int]string
-	secHeaders    bool
-	precompressed bool
-	cache         *fileCache
+	root           string
+	prefix         string
+	cacheTTL       string
+	cacheTTLHdr    []string
+	setHeaders     map[string]string
+	setHeadersHdr  map[string][]string
+	respHeadersHdr map[string][]string
+	spa            bool
+	autoindex      bool
+	errorPages     map[int]string
+	secHeaders     bool
+	precompressed  bool
+	cache          *fileCache
 }
 
 func New(route config.Route) *Handler {
@@ -96,10 +97,28 @@ func New(route config.Route) *Handler {
 			h.setHeadersHdr[http.CanonicalHeaderKey(k)] = []string{v}
 		}
 	}
+	if len(route.ResponseHeaders) > 0 {
+		h.respHeadersHdr = make(map[string][]string, len(route.ResponseHeaders))
+		for k, v := range route.ResponseHeaders {
+			h.respHeadersHdr[http.CanonicalHeaderKey(k)] = []string{v}
+		}
+	}
 	if route.StaticCacheTTL != nil && route.StaticCacheTTL.Duration > 0 {
 		h.cache = newFileCache(route.StaticCacheTTL.Duration, route.EffectiveStaticCacheMaxBytes())
 	}
 	return h
+}
+
+// applyResponseHeaders copies the configured response headers into hdr:
+// set_headers first, then response_headers so the explicit response field wins
+// when both name the same header.
+func (h *Handler) applyResponseHeaders(hdr http.Header) {
+	for k, v := range h.setHeadersHdr {
+		hdr[k] = v
+	}
+	for k, v := range h.respHeadersHdr {
+		hdr[k] = v
+	}
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -351,9 +370,7 @@ func (h *Handler) serveContent(w http.ResponseWriter, r *http.Request, src io.Re
 		hdr["X-Frame-Options"] = denyFrameHeader
 		hdr["Referrer-Policy"] = referrerHeader
 	}
-	for k, v := range h.setHeadersHdr {
-		hdr[k] = v
-	}
+	h.applyResponseHeaders(hdr)
 
 	w.WriteHeader(http.StatusOK)
 	writeBody(w, src)
@@ -399,9 +416,7 @@ func (h *Handler) serveCached(w http.ResponseWriter, r *http.Request, e *cacheEn
 		hdr["X-Frame-Options"] = denyFrameHeader
 		hdr["Referrer-Policy"] = referrerHeader
 	}
-	for k, v := range h.setHeadersHdr {
-		hdr[k] = v
-	}
+	h.applyResponseHeaders(hdr)
 
 	w.WriteHeader(http.StatusOK)
 	w.Write(e.data)
@@ -424,9 +439,7 @@ func (h *Handler) writeNotModified(w http.ResponseWriter, etag, lastMod string) 
 		hdr["X-Frame-Options"] = denyFrameHeader
 		hdr["Referrer-Policy"] = referrerHeader
 	}
-	for k, v := range h.setHeadersHdr {
-		hdr[k] = v
-	}
+	h.applyResponseHeaders(hdr)
 	w.WriteHeader(http.StatusNotModified)
 }
 
@@ -475,9 +488,7 @@ func (h *Handler) serveRange(w http.ResponseWriter, r *http.Request, src io.Read
 	if h.secHeaders {
 		hdr["X-Content-Type-Options"] = nosniffHeader
 	}
-	for k, v := range h.setHeadersHdr {
-		hdr[k] = v
-	}
+	h.applyResponseHeaders(hdr)
 
 	w.WriteHeader(http.StatusPartialContent)
 	src.Seek(ra.start, io.SeekStart)

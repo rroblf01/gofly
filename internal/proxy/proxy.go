@@ -314,6 +314,12 @@ func (p *Proxy) serveHTTP(w http.ResponseWriter, r *http.Request, up *UpstreamSt
 		}
 		removeConnectionHeaders(w.Header())
 
+		// Route response headers are applied last so they win over any value
+		// the upstream set, matching nginx add_header.
+		for k, v := range p.route.ResponseHeaders {
+			w.Header().Set(k, expandVars(v, r))
+		}
+
 		w.WriteHeader(resp.StatusCode)
 		// io.Copy detects WriterTo on http.Response.Body (Go 1.20+) and may
 		// use splice(2) for zero-copy TCP forwarding on Linux.

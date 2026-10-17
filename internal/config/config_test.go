@@ -458,6 +458,27 @@ func TestLoad_EnvVarSetHeaders(t *testing.T) {
 	}
 }
 
+func TestLoad_EnvVarResponseHeaders(t *testing.T) {
+	os.Setenv("GOFLY_FRAME", "DENY")
+	defer os.Unsetenv("GOFLY_FRAME")
+
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+	data := `{"routes":[{"path":"/","upstreams":["http://localhost:3000"],"response_headers":{"X-Frame-Options":"${GOFLY_FRAME}"}}]}`
+	if err := os.WriteFile(cfgPath, []byte(data), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(cfgPath)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if got := cfg.Routes[0].ResponseHeaders["X-Frame-Options"]; got != "DENY" {
+		t.Errorf("after expansion = %q, want %q", got, "DENY")
+	}
+}
+
 func TestLoad_MissingEnvVar(t *testing.T) {
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "config.json")

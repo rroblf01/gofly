@@ -106,6 +106,35 @@ func TestNotModifiedIncludesSetHeaders(t *testing.T) {
 	}
 }
 
+func TestStatic_ResponseHeaders(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(dir+"/index.html", []byte("hi"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	h := New(config.Route{
+		Path:      "/",
+		StaticDir: dir,
+		SetHeaders: map[string]string{
+			"X-Both": "from-set",
+		},
+		ResponseHeaders: map[string]string{
+			"X-Frame-Options": "DENY",
+			"X-Both":          "from-response",
+		},
+	})
+
+	resp := httptest.NewRecorder()
+	h.ServeHTTP(resp, httptest.NewRequest("GET", "/index.html", nil))
+
+	if got := resp.Header().Get("X-Frame-Options"); got != "DENY" {
+		t.Errorf("X-Frame-Options = %q, want DENY", got)
+	}
+	// response_headers wins over set_headers on a name clash.
+	if got := resp.Header().Get("X-Both"); got != "from-response" {
+		t.Errorf("X-Both = %q, want from-response", got)
+	}
+}
+
 func TestExtraMIMETypes(t *testing.T) {
 	cases := map[string]string{
 		".webmanifest": "application/manifest+json",

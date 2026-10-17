@@ -148,6 +148,7 @@ gofly uses a single JSON config file. Default path: `/etc/gofly/config.json` (ov
         "X-Real-IP": "$remote_addr"
       },
       "remove_headers": ["X-Internal"],
+      "response_headers": {"X-Frame-Options": "DENY"},
       "host": "backend.internal",
       "rewrite": "/v2$uri",
       "retry_on_error": true,
@@ -211,6 +212,7 @@ gofly uses a single JSON config file. Default path: `/etc/gofly/config.json` (ov
 | `gzip_level` | int | `-1` (default) | gzip compression level `[-2,9]` (`1`=fastest, `9`=best, `-1`=default) |
 | `gzip_min_length` | int | `0` | Minimum response size in bytes before compressing (0 = always) |
 | `set_headers` | object | — | Headers to inject into upstream requests (supports `$remote_addr`, `$host`, `$scheme`, `$uri`, `$request_uri`) |
+| `response_headers` | object | — | Headers to add to the response sent to the client (proxy and static routes; the nginx `add_header` equivalent, supports the same variables) |
 | `remove_headers` | []string | — | Headers to strip from upstream requests |
 | `host` | string | — | Override the Host header |
 | `rewrite` | string | — | Rewrite request path before forwarding |
@@ -265,8 +267,8 @@ gofly -t -config config.json                         # then validate the result
 
 **Translated:** `listen` (port + `ssl`), `server_name`, `root`, `location`
 (prefix, `=`, `^~`), `try_files …/index.html` → `spa`, `proxy_pass` +
-`upstream` blocks (incl. `least_conn`), `add_header`/`proxy_set_header` →
-`set_headers`, `expires` → `browser_cache_ttl`, `gzip`/`gzip_min_length`/
+`upstream` blocks (incl. `least_conn`), `add_header` → `response_headers`,
+`proxy_set_header` → `set_headers`, `expires` → `browser_cache_ttl`, `gzip`/`gzip_min_length`/
 `gzip_comp_level`, and `ssl_certificate`/`ssl_certificate_key` → `tls`.
 
 **Not translated (warned, not silently dropped):** regex `location ~`/`~*`
