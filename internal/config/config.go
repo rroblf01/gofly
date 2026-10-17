@@ -29,10 +29,10 @@ const DefaultStaticCacheMaxBytes int64 = 64 << 20 // 64 MiB
 type Config struct {
 	Port                int        `json:"port"`
 	Workers             int        `json:"workers,omitempty"`
-	ReadTimeout         Duration   `json:"read_timeout,omitempty"`
-	WriteTimeout        Duration   `json:"write_timeout,omitempty"`
+	ReadTimeout         Duration   `json:"read_timeout,omitzero"`
+	WriteTimeout        Duration   `json:"write_timeout,omitzero"`
 	SendTimeout         *Duration  `json:"send_timeout,omitempty"`
-	IdleTimeout         Duration   `json:"idle_timeout,omitempty"`
+	IdleTimeout         Duration   `json:"idle_timeout,omitzero"`
 	MaxBodySize         int64      `json:"max_body_size,omitempty"`
 	RateLimit           *RateLimit `json:"rate_limit,omitempty"`
 	TLS                 *TLSConfig `json:"tls,omitempty"`

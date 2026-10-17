@@ -1,6 +1,7 @@
 package nginx
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -312,6 +313,29 @@ func TestConvertInheritedRootAppendsLocationPath(t *testing.T) {
 	}
 	if got := cfg.Routes[0].StaticDir; got != "/var/www/assets" {
 		t.Errorf("inherited root static_dir = %q, want /var/www/assets", got)
+	}
+}
+
+func TestConvertOmitsUntranslatedTimeouts(t *testing.T) {
+	// A minimal nginx.conf has no timeout directives, so the converted JSON
+	// must not invent any. Emitting write_timeout in particular would make it
+	// explicit in the generated config and cap static download time in gofly.
+	cfg, _, err := Convert(strings.NewReader(`server { listen 80; root /www; }`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(out, &raw); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"read_timeout", "write_timeout", "idle_timeout"} {
+		if _, ok := raw[key]; ok {
+			t.Errorf("converted config contains %q without a matching directive: %s", key, out)
+		}
 	}
 }
 

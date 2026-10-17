@@ -45,6 +45,14 @@ func Convert(r io.Reader) (config.Config, []string, error) {
 	}
 	c := &converter{cfg: config.Default()}
 	c.cfg.Routes = nil
+	// Only emit the timeouts this converter actually translates. config.Default()
+	// carries the runtime defaults, and leaving them in the generated config
+	// would make them explicit there — write_timeout in particular then caps the
+	// total static download time in gofly, re-introducing the slow-download
+	// cutoff that a hand-written config (with no write_timeout) does not have.
+	c.cfg.ReadTimeout = config.Duration{}
+	c.cfg.WriteTimeout = config.Duration{}
+	c.cfg.IdleTimeout = config.Duration{}
 	c.walkTop(dirs)
 	if len(c.cfg.Routes) == 0 {
 		c.warnf(0, "no server/location produced a route; resulting config has no routes")
