@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v1.3.0 (2026-10-17)
 
 Backwards-compatible within `1.x`: all new config fields are optional and default
 to the previous behaviour (except the static-download fix below, which is the
