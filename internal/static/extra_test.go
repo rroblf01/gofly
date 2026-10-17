@@ -1,6 +1,8 @@
 package static
 
 import (
+	"io"
+	"mime"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -9,6 +11,59 @@ import (
 
 	"github.com/rroblf01/gofly/internal/config"
 )
+
+func TestPrecompressedUnknownExtensionMIME(t *testing.T) {
+	dir := t.TempDir()
+	// An extension absent from Go's built-in table and from the host's
+	// /etc/mime.types, mirroring the scratch image where TypeByExtension
+	// returns "" for most application-specific extensions (e.g. .py). Before
+	// the fix the pre-compressed path sniffed the gzip bytes and reported
+	// application/x-gzip.
+	const name = "app.goflyunknown"
+	if err := os.WriteFile(dir+"/"+name, []byte("plain text body"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dir+"/"+name+".gz", []byte("gzipbytes"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	h := New(config.Route{Path: "/", StaticDir: dir})
+
+	// Identity request: the source is sniffed, so it is text/plain.
+	resp := httptest.NewRecorder()
+	h.ServeHTTP(resp, httptest.NewRequest("GET", "/"+name, nil))
+	if ct := resp.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/plain") {
+		t.Errorf("identity Content-Type = %q, want text/plain*", ct)
+	}
+
+	// Pre-compressed request: the compressed bytes must never be sniffed.
+	resp = httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/"+name, nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+	h.ServeHTTP(resp, req)
+	if ct := resp.Header().Get("Content-Type"); ct != octetStreamContentType {
+		t.Errorf("precompressed Content-Type = %q, want %q", ct, octetStreamContentType)
+	}
+	if ce := resp.Header().Get("Content-Encoding"); ce != "gzip" {
+		t.Errorf("Content-Encoding = %q, want gzip", ce)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "gzipbytes" {
+		t.Errorf("body = %q, want gzipbytes", body)
+	}
+}
+
+func TestExtraMIMETypes(t *testing.T) {
+	cases := map[string]string{
+		".webmanifest": "application/manifest+json",
+		".woff2":       "font/woff2",
+		".map":         "application/json",
+	}
+	for ext, want := range cases {
+		if got := mime.TypeByExtension(ext); got != want {
+			t.Errorf("mime.TypeByExtension(%q) = %q, want %q", ext, got, want)
+		}
+	}
+}
 
 func TestValidPath(t *testing.T) {
 	if !validPath("/index.html") {

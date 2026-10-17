@@ -33,6 +33,27 @@ var (
 	acceptEncodingHeader = []string{"Accept-Encoding"}
 )
 
+// octetStreamContentType is the fallback for a file whose extension is not in
+// the MIME table and whose bytes must not be sniffed (e.g. a pre-compressed
+// body, where sniffing would report application/x-gzip).
+const octetStreamContentType = "application/octet-stream"
+
+// init registers web types that Go's baked-in table misses. The scratch image
+// ships no /etc/mime.types, so without this a .webmanifest (or font) would be
+// sniffed and served as text/plain.
+func init() {
+	for ext, typ := range map[string]string{
+		".webmanifest": "application/manifest+json",
+		".woff":        "font/woff",
+		".woff2":       "font/woff2",
+		".ttf":         "font/ttf",
+		".otf":         "font/otf",
+		".map":         "application/json",
+	} {
+		_ = mime.AddExtensionType(ext, typ)
+	}
+}
+
 type Handler struct {
 	root          string
 	prefix        string
@@ -195,10 +216,18 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				// the encoding (and Content-Type comes from the original name, not
 				// ".gz"). Without Content-Encoding the client receives raw gzip
 				// labelled as the identity type and renders garbage.
+				//
+				// The type is looked up by the original extension and never
+				// sniffed: the bytes are compressed, so sniffing an unknown
+				// extension would report application/x-gzip.
+				ctype := mime.TypeByExtension(filepath.Ext(gz.orig))
+				if ctype == "" {
+					ctype = octetStreamContentType
+				}
 				hdr := w.Header()
 				hdr["Content-Encoding"] = gzipEncodingHeader
 				hdr["Vary"] = acceptEncodingHeader
-				h.serveFile(w, r, gz.f, gz.stat, gz.orig)
+				h.serveContent(w, r, gz.f, gz.stat.Size(), gz.stat.ModTime(), etagFor(gz.stat), ctype, false)
 				return
 			}
 		}
@@ -261,14 +290,18 @@ func etagFor(stat os.FileInfo) string {
 }
 
 func (h *Handler) serveFile(w http.ResponseWriter, r *http.Request, f *os.File, stat os.FileInfo, origName string) {
-	h.serveContent(w, r, f, stat.Size(), stat.ModTime(), etagFor(stat), mime.TypeByExtension(filepath.Ext(origName)))
+	h.serveContent(w, r, f, stat.Size(), stat.ModTime(), etagFor(stat), mime.TypeByExtension(filepath.Ext(origName)), true)
 }
 
 // serveContent writes a response from any seekable source (an *os.File for the
 // streaming path, a *bytes.Reader for the in-memory cache), handling
 // conditional requests, byte ranges and the standard header set. A *os.File
 // source still benefits from sendfile via the ResponseWriter's ReaderFrom.
-func (h *Handler) serveContent(w http.ResponseWriter, r *http.Request, src io.ReadSeeker, size int64, modTime time.Time, etag, ctype string) {
+//
+// sniff controls whether an empty ctype may be resolved by reading the source
+// bytes. It must be false when src is a compressed body, otherwise the sniff
+// reports application/x-gzip for any extension the MIME table does not know.
+func (h *Handler) serveContent(w http.ResponseWriter, r *http.Request, src io.ReadSeeker, size int64, modTime time.Time, etag, ctype string, sniff bool) {
 	lastMod := modTime.UTC().Format(http.TimeFormat)
 
 	if match := r.Header.Get("If-None-Match"); match != "" {
@@ -298,11 +331,15 @@ func (h *Handler) serveContent(w http.ResponseWriter, r *http.Request, src io.Re
 	}
 
 	if ctype == "" {
-		bufp := sniffPool.Get().(*[]byte)
-		n, _ := src.Read(*bufp)
-		ctype = http.DetectContentType((*bufp)[:n])
-		src.Seek(0, io.SeekStart)
-		sniffPool.Put(bufp)
+		if sniff {
+			bufp := sniffPool.Get().(*[]byte)
+			n, _ := src.Read(*bufp)
+			ctype = http.DetectContentType((*bufp)[:n])
+			src.Seek(0, io.SeekStart)
+			sniffPool.Put(bufp)
+		} else {
+			ctype = octetStreamContentType
+		}
 	}
 
 	if rangeHdr := r.Header.Get("Range"); rangeHdr != "" && strings.HasPrefix(rangeHdr, "bytes=") {
