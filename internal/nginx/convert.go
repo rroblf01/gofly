@@ -9,7 +9,9 @@ package nginx
 import (
 	"fmt"
 	"io"
+	"maps"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -460,8 +462,13 @@ func (c *converter) parseLocation(loc directive, srv serverCtx) {
 			if len(s.args) >= 2 {
 				// nginx does not inherit server-level add_header once a
 				// location defines any of its own; drop the inherited set on
-				// the first location add_header.
+				// the first location add_header, and say so explicitly since
+				// the dropped headers are otherwise easy to miss.
 				if !locHeader {
+					if len(srv.headers) > 0 {
+						c.warnf(s.line, "location %s defines add_header; server-level add_header are not inherited (nginx rule), dropping: %s",
+							path, strings.Join(slices.Sorted(maps.Keys(srv.headers)), ", "))
+					}
 					respHeaders = map[string]string{}
 					locHeader = true
 				}

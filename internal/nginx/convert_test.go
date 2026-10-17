@@ -367,6 +367,28 @@ func TestConvertSendTimeout(t *testing.T) {
 	}
 }
 
+func TestConvertLocationAddHeaderWarning(t *testing.T) {
+	src := `server {
+  listen 80;
+  root /www;
+  add_header Cross-Origin-Opener-Policy same-origin;
+  add_header Cross-Origin-Embedder-Policy require-corp;
+  location / { add_header Cache-Control no-cache; }
+}`
+	_, warns, err := Convert(strings.NewReader(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasWarning(warns, "not inherited") {
+		t.Errorf("expected a warning about dropped server add_header, got %v", warns)
+	}
+	for _, h := range []string{"Cross-Origin-Opener-Policy", "Cross-Origin-Embedder-Policy"} {
+		if !hasWarning(warns, h) {
+			t.Errorf("warning does not name dropped header %q: %v", h, warns)
+		}
+	}
+}
+
 func TestConvertGzipStatic(t *testing.T) {
 	src := `server {
   listen 80;
