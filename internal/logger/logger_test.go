@@ -64,7 +64,7 @@ func TestNilSafety(t *testing.T) {
 	Error("safe", nil)
 	Debug("safe", nil)
 	Warn("safe", nil)
-	LogAccess(time.Now(), "GET", "/", 200, time.Second, "up")
+	LogAccess(time.Now(), "GET", "/", 200, time.Second, "up", 0)
 	WithRequestID(context.Background(), "x")
 	RequestID(context.Background())
 }
@@ -85,7 +85,7 @@ func TestLogAccess(t *testing.T) {
 	defer func() { log = nil }()
 
 	start := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
-	LogAccess(start, "POST", "/api/test", 201, 500*time.Millisecond, "localhost")
+	LogAccess(start, "POST", "/api/test", 201, 500*time.Millisecond, "localhost", 1234)
 
 	if buf.Len() == 0 {
 		t.Fatal("expected log output")
@@ -106,6 +106,9 @@ func TestLogAccess(t *testing.T) {
 	}
 	if result["upstream"] != "localhost" {
 		t.Errorf("expected upstream 'localhost', got %v", result["upstream"])
+	}
+	if b, ok := result["bytes"].(float64); !ok || b != 1234 {
+		t.Errorf("expected bytes 1234, got %v", result["bytes"])
 	}
 }
 

@@ -34,6 +34,7 @@ type logEntry struct {
 	status   int
 	duration time.Duration
 	upstream string
+	bytes    int64
 }
 
 type Server struct {
@@ -495,11 +496,11 @@ func (s *Server) startLogWorker() {
 		for {
 			select {
 			case entry := <-s.logCh:
-				logger.LogAccess(entry.start, entry.method, entry.path, entry.status, entry.duration, entry.upstream)
+				logger.LogAccess(entry.start, entry.method, entry.path, entry.status, entry.duration, entry.upstream, entry.bytes)
 			case <-s.stopLog:
 				for len(s.logCh) > 0 {
 					entry := <-s.logCh
-					logger.LogAccess(entry.start, entry.method, entry.path, entry.status, entry.duration, entry.upstream)
+					logger.LogAccess(entry.start, entry.method, entry.path, entry.status, entry.duration, entry.upstream, entry.bytes)
 				}
 				return
 			}
@@ -547,7 +548,7 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 			}
 			if logOn {
 				select {
-				case s.logCh <- logEntry{start, r.Method, r.URL.Path, lrw.status, dur, lrw.upstream}:
+				case s.logCh <- logEntry{start, r.Method, r.URL.Path, lrw.status, dur, lrw.upstream, lrw.bytes}:
 				default:
 				}
 			}

@@ -82,7 +82,7 @@ func slogFields(fields LogFields) []any {
 	return attrs
 }
 
-func LogAccess(start time.Time, method, path string, status int, dur time.Duration, upstream string) {
+func LogAccess(start time.Time, method, path string, status int, dur time.Duration, upstream string, bytes int64) {
 	if log != nil {
 		log.Info("access",
 			slog.String("method", method),
@@ -90,6 +90,7 @@ func LogAccess(start time.Time, method, path string, status int, dur time.Durati
 			slog.Int("status", status),
 			slog.Duration("duration", dur),
 			slog.String("upstream", upstream),
+			slog.Int64("bytes", bytes),
 			slog.String("ts", start.Format(time.RFC3339)),
 		)
 	}

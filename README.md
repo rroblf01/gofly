@@ -224,9 +224,17 @@ gofly uses a single JSON config file. Default path: `/etc/gofly/config.json` (ov
 | `upstream_timeout` | string | — | Response header timeout for upstream connections |
 | `max_body_size` | int | — | Per-route override for max body size |
 
+> **ETag and container rebuilds.** A static file's `ETag`/`Last-Modified` come
+> from its modification time and size, so every `docker build` that rewrites the
+> files invalidates all client caches. This matches nginx. For content-hashed or
+> versioned asset paths, add an immutable policy (e.g.
+> `"response_headers": {"Cache-Control": "public, max-age=31536000, immutable"}`
+> on that route) so clients stop revalidating on each release.
+
 ### Variable substitution
 
-The following variables are expanded in `set_headers`, `host`, and `rewrite`:
+The following variables are expanded in `set_headers`, `response_headers` (proxy
+routes), `host`, and `rewrite`:
 
 | Variable | Description |
 |---|---|

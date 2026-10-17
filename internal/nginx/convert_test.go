@@ -343,6 +343,28 @@ func TestConvertSendTimeout(t *testing.T) {
 	}
 }
 
+func TestConvertGzipStatic(t *testing.T) {
+	src := `server {
+  listen 80;
+  gzip_static on;
+  location /a/ { root /www; }
+  location /b/ { root /www; gzip_static off; }
+}`
+	cfg, _, err := Convert(strings.NewReader(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Routes) != 2 {
+		t.Fatalf("routes = %d, want 2", len(cfg.Routes))
+	}
+	if p := cfg.Routes[0].Precompressed; p == nil || !*p {
+		t.Errorf("server gzip_static on = %v, want true", p)
+	}
+	if p := cfg.Routes[1].Precompressed; p == nil || *p {
+		t.Errorf("location gzip_static off = %v, want false", p)
+	}
+}
+
 func TestConvertServerRootOnly(t *testing.T) {
 	src := `server { listen 80; root /srv/www; }`
 	cfg, _, err := Convert(strings.NewReader(src))

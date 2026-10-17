@@ -215,6 +215,7 @@ type httpDefaults struct {
 	gzip          *bool
 	gzipMinLength int
 	gzipLevel     *int
+	precompressed *bool
 }
 
 func (c *converter) walkTop(dirs []directive) {
@@ -254,6 +255,10 @@ func (c *converter) walkTop(dirs []directive) {
 				} else {
 					c.warnf(d.line, "send_timeout %q: unrecognised time; ignored", strings.Join(d.args, " "))
 				}
+			case "gzip_static":
+				if p := gzipStatic(d.args, c, d.line); p != nil {
+					def.precompressed = p
+				}
 			case "gzip_types", "gzip_vary", "gzip_proxied", "gzip_disable":
 				c.warnf(d.line, "gzip tuning %q not configurable in gofly (it gzips by size); skipped", d.name)
 			case "include":
@@ -281,6 +286,10 @@ func (c *converter) walkTop(dirs []directive) {
 						c.cfg.SendTimeout = td
 					} else {
 						c.warnf(h.line, "send_timeout %q: unrecognised time; ignored", strings.Join(h.args, " "))
+					}
+				case "gzip_static":
+					if p := gzipStatic(h.args, c, h.line); p != nil {
+						def.precompressed = p
 					}
 				}
 			}
@@ -324,6 +333,7 @@ func (c *converter) parseServer(d directive, def httpDefaults) {
 		gzipMinLength: def.gzipMinLength,
 		gzipLevel:     def.gzipLevel,
 		headers:       map[string]string{},
+		precompressed: def.precompressed,
 	}
 	var locations []directive
 
@@ -360,6 +370,10 @@ func (c *converter) parseServer(d directive, def httpDefaults) {
 			} else {
 				c.warnf(s.line, "send_timeout %q: unrecognised time; ignored", strings.Join(s.args, " "))
 			}
+		case "gzip_static":
+			if p := gzipStatic(s.args, c, s.line); p != nil {
+				srv.precompressed = p
+			}
 		case "location":
 			locations = append(locations, s)
 		case "error_page":
@@ -395,6 +409,7 @@ type serverCtx struct {
 	gzipLevel     *int
 	headers       map[string]string
 	sendTimeout   *config.Duration
+	precompressed *bool
 }
 
 func (c *converter) parseLocation(loc directive, srv serverCtx) {
@@ -404,16 +419,17 @@ func (c *converter) parseLocation(loc directive, srv serverCtx) {
 	}
 
 	var (
-		proxyPass   string
-		tryFiles    bool
-		root        = srv.root
-		alias       string
-		expires     string
-		gzip        = srv.gzip
-		sendTimeout = srv.sendTimeout
-		respHeaders = cloneMap(srv.headers) // inherited server add_header
-		locHeader   bool                    // location defined its own add_header
-		reqHeaders  = map[string]string{}   // proxy_set_header
+		proxyPass     string
+		tryFiles      bool
+		root          = srv.root
+		alias         string
+		expires       string
+		gzip          = srv.gzip
+		sendTimeout   = srv.sendTimeout
+		precompressed = srv.precompressed
+		respHeaders   = cloneMap(srv.headers) // inherited server add_header
+		locHeader     bool                    // location defined its own add_header
+		reqHeaders    = map[string]string{}   // proxy_set_header
 	)
 	for _, s := range loc.block {
 		switch s.name {
@@ -451,6 +467,10 @@ func (c *converter) parseLocation(loc directive, srv serverCtx) {
 			} else {
 				c.warnf(s.line, "send_timeout %q: unrecognised time; ignored", strings.Join(s.args, " "))
 			}
+		case "gzip_static":
+			if p := gzipStatic(s.args, c, s.line); p != nil {
+				precompressed = p
+			}
 		case "proxy_set_header":
 			if len(s.args) >= 2 {
 				reqHeaders[s.args[0]] = s.args[1]
@@ -471,6 +491,7 @@ func (c *converter) parseLocation(loc directive, srv serverCtx) {
 
 	route := c.staticRoute(path, staticDirFor(root, alias, path), srv, respHeaders)
 	route.SendTimeout = sendTimeout
+	route.Precompressed = precompressed
 	route.SPA = tryFiles
 	route.Gzip = gzip
 	if expires != "" {
@@ -517,6 +538,7 @@ func (c *converter) staticRoute(path, staticDir string, srv serverCtx, respHeade
 		GzipMinLength: srv.gzipMinLength,
 		GzipLevel:     srv.gzipLevel,
 		SendTimeout:   srv.sendTimeout,
+		Precompressed: srv.precompressed,
 	}
 	if len(respHeaders) > 0 {
 		r.ResponseHeaders = respHeaders
@@ -596,6 +618,26 @@ func arg0(args []string) string {
 }
 
 func onOff(args []string) bool { return len(args) > 0 && args[0] == "on" }
+
+// gzipStatic maps `gzip_static on|off|always` to the precompressed flag. gofly
+// only serves a pre-compressed sibling when the client sends Accept-Encoding,
+// so `always` (which nginx honors regardless) is mapped to on with a warning.
+func gzipStatic(args []string, c *converter, line int) *bool {
+	if len(args) == 0 {
+		return nil
+	}
+	switch args[0] {
+	case "on":
+		return boolPtr(true)
+	case "off":
+		return boolPtr(false)
+	case "always":
+		c.warnf(line, "gzip_static always: gofly serves pre-compressed files only when the client sends Accept-Encoding; mapped to on")
+		return boolPtr(true)
+	default:
+		return nil
+	}
+}
 
 // nginxDuration parses an nginx time argument (e.g. "60s") into a config
 // Duration, reporting false for a missing or unrecognised value.
