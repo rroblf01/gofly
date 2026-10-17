@@ -1,5 +1,28 @@
 # Changelog
 
+## v1.3.1 (2026-10-17)
+
+Backwards-compatible within `1.x`.
+
+### Fixes
+
+- **`-convert` no longer emits timeouts it did not translate** — the generated
+  config no longer carries `read_timeout`/`write_timeout`/`idle_timeout` copied
+  from the runtime defaults. An explicit `write_timeout` caps the total static
+  download time, so every config produced by `-convert` re-introduced the
+  slow-download cutoff the 1.3.0 streaming fix had removed. A timeout is emitted
+  only when nginx has an equivalent directive (`send_timeout`). Covered by an
+  end-to-end test that converts a minimal config, loads it exactly as the binary
+  does and completes a slow multi-chunk download.
+- **Converter warns when a location's `add_header` suppresses the server's**,
+  naming the headers that are no longer inherited (see the 1.3.0 behavior note).
+- **The published image reports its real version** — the release workflow now
+  bakes the release tag into the binary, so `gofly -version` prints (for
+  example) `gofly v1.3.1` instead of `gofly dev`.
+- **Pre-compressed responses use the same `Content-Type` as the identity
+  response** for an unknown extension, by sniffing the uncompressed sibling
+  instead of falling back to `application/octet-stream`.
+
 ## v1.3.0 (2026-10-17)
 
 Backwards-compatible within `1.x`: all new config fields are optional and default
@@ -37,6 +60,16 @@ intended correction).
 - **304 responses now repeat `set_headers`/`response_headers` and the security
   headers**, as RFC 9110 requires, so a cache-policy change reaches clients
   without waiting for the next 200.
+
+### Behavior changes
+
+- **`add_header` inheritance in the converter** — when a `location` defines its
+  own `add_header`, the converter now stops carrying the `server`-level
+  `add_header` into that route, matching nginx. In 1.2.0 they were merged, so a
+  migrated config that relied on that merge loses those headers (for example
+  `Cross-Origin-Opener-Policy`) on locations with their own `add_header`. This
+  is the nginx rule and is intentional; v1.3.1 adds a converter warning naming
+  the dropped headers.
 
 ## v1.2.0 (2026-08-31)
 

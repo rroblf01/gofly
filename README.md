@@ -287,6 +287,23 @@ gofly -t -config config.json                         # then validate the result
 set. Review every warning — the converted route set may need hand-editing where
 nginx used a feature gofly does not have.
 
+Only timeouts with an nginx equivalent are written: `send_timeout` is
+translated, while `read_timeout`/`write_timeout`/`idle_timeout` are left out so
+the runtime defaults apply (an explicit `write_timeout` would cap static
+download time).
+
+Two converter behaviors are worth knowing when migrating:
+
+- **`root` vs `alias`** — a `location`'s `root` appends the location path
+  (`location /sub/ { root /www; }` serves from `/www/sub`), while `alias`
+  replaces the matched prefix. This matches nginx, but a config that previously
+  relied on the old (incorrect) `root` handling may now 404 where it used to
+  return the wrong file.
+- **`add_header` inheritance** — if a `location` defines its own `add_header`,
+  the `server`-level ones are **not** inherited (nginx rule). The converter
+  warns and names the headers it drops, so a migrated security header does not
+  disappear unnoticed.
+
 #### Converting at build time in a Dockerfile
 
 The runtime gofly image is `scratch` — no shell — so it cannot run
